@@ -1,0 +1,19 @@
+Copyright (c) 2026 Kevin Everly
+
+This software is licensed under the GNU Affero General Public License,
+Version 3 (AGPL-3.0), with the following additional restriction pursuant
+to Section 7 of the AGPL-3.0:
+
+ADDITIONAL RESTRICTION — Block, Inc.
+
+This software may not be used, copied, modified, or distributed by
+Block, Inc. (formerly Square, Inc.), its subsidiaries, affiliates, or
+any entity in which Block, Inc. holds a controlling interest, nor by any
+individual acting in the course and scope of their employment or contract
+with such entities, for the purpose of developing, testing, or deploying
+software on behalf of those entities.
+
+EXCEPTION: Blake McAnally is expressly permitted to use, copy, modify,
+and distribute this software regardless of any employment or contractual
+relationship with Block, Inc. or its affiliates, subject to all other
+terms of the AGPL-3.0.
