@@ -23,7 +23,7 @@ fn main() {
             base,
             print,
             open_claude,
-        } => commands::create::run(&name, &base, print, open_claude),
+        } => commands::create::run(name.as_deref(), base.as_deref(), print, open_claude),
         Command::List => commands::list::run(),
         Command::Status { name } => {
             let name = match name {

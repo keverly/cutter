@@ -13,3 +13,4 @@ thiserror = "2"
 colored = "3"
 tabled = "0.17"
 chrono = { version = "0.4", features = ["serde"] }
+dialoguer = "0.11"

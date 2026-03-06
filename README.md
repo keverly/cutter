@@ -36,7 +36,10 @@ cargo install --path .
 # Define a base with your repos
 cutter base add platform ~/repos/frontend ~/repos/backend ~/repos/shared-libs
 
-# Create a workspace (creates worktrees on branch "my-feature")
+# Create a workspace interactively (prompts for name, base, etc.)
+cutter create
+
+# Or pass arguments directly
 cutter create my-feature --base platform
 
 # Check status
@@ -59,7 +62,7 @@ cutter remove my-feature
 | `cutter base add <name> <path>...` | Define a base from local git repos |
 | `cutter base list` | List all bases |
 | `cutter base remove <name>` | Remove a base definition |
-| `cutter create <name> --base <base>` | Create workspace with worktrees on branch `<name>` |
+| `cutter create [name] [--base <base>]` | Create workspace (interactive if args omitted) |
 | `cutter list` | List all workspaces |
 | `cutter status <name>` | Show repo status (branch, changes, ahead/behind) |
 | `cutter remove <name>` | Remove worktrees, branch, and workspace directory |

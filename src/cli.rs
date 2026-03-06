@@ -19,11 +19,11 @@ pub enum Command {
     /// Create a new workspace from a base
     Create {
         /// Workspace name (also used as branch name)
-        name: String,
+        name: Option<String>,
 
         /// Base to create from
         #[arg(long)]
-        base: String,
+        base: Option<String>,
 
         /// Print workspace path after creation
         #[arg(long, group = "open_mode")]
