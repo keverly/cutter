@@ -205,6 +205,7 @@ dependencies = [
  "dialoguer",
  "dirs",
  "serde",
+ "serde_json",
  "tabled",
  "thiserror 2.0.18",
  "toml",

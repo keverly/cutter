@@ -78,6 +78,17 @@ cutter remove my-feature
 
 - `--keep-files` — remove worktrees from git but keep files on disk
 
+## `.claude` merging
+
+When creating a workspace, cutter automatically merges the `.claude` directories from each repo into a single `.claude` directory at the workspace root. This gives Claude unified context across all repos when launched from the workspace.
+
+- **`CLAUDE.md`** — concatenated with headers indicating which repo each section came from
+- **`settings.local.json`** — `permissions.allow` and `permissions.deny` arrays are merged and deduplicated
+- **Subdirectories** (e.g. `skills/`) — recursively copied, preserving structure
+- **Other files** — copied directly; if multiple repos share the same filename, each copy is prefixed with its repo name
+
+If no repos contain a `.claude` directory, the step is skipped.
+
 ## Data Layout
 
 ```
@@ -88,6 +99,10 @@ cutter remove my-feature
 
 ~/cutter/
 └── my-feature/              # Workspace root
+    ├── .claude/             # Merged from all repos
+    │   ├── CLAUDE.md
+    │   ├── settings.local.json
+    │   └── skills/
     ├── frontend/            # Worktree (branch = my-feature)
     ├── backend/             # Worktree (branch = my-feature)
     └── shared-libs/         # Worktree (branch = my-feature)

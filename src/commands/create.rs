@@ -1,7 +1,8 @@
 use chrono::Utc;
 use colored::Colorize;
 use dialoguer::{Confirm, Input, Select};
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use crate::config::{Config, workspace_root_dir};
 use crate::error::{Error, Result};
@@ -149,6 +150,9 @@ pub fn run(name: Option<&str>, base_name: Option<&str>, print: bool, open_claude
         }
     }
 
+    // Merge .claude directories from each repo into workspace root
+    merge_claude_dirs(&workspace_dir, &created_worktrees, quiet)?;
+
     let ws_config = WorkspaceConfig {
         workspace: WorkspaceInfo {
             name: name.to_string(),
@@ -178,6 +182,174 @@ pub fn run(name: Option<&str>, base_name: Option<&str>, print: bool, open_claude
             .status()?;
         if !status.success() {
             return Err(Error::Git("claude exited with non-zero status".into()));
+        }
+    }
+
+    Ok(())
+}
+
+/// Merge .claude directories from each repo worktree into the workspace root.
+///
+/// - CLAUDE.md files are concatenated with repo name headers
+/// - settings.local.json files have their allow/deny lists merged
+/// - Subdirectories (e.g. skills/) are recursively copied and merged
+/// - Other files are copied; conflicts are resolved by appending repo name
+fn merge_claude_dirs(workspace_dir: &Path, worktrees: &[(PathBuf, PathBuf)], quiet: bool) -> Result<()> {
+    let mut claude_md_parts: Vec<(String, String)> = Vec::new();
+    let mut merged_allow: Vec<String> = Vec::new();
+    let mut merged_deny: Vec<String> = Vec::new();
+    // Maps relative path (from .claude/) -> list of (repo_name, absolute_path)
+    let mut other_files: HashMap<PathBuf, Vec<(String, PathBuf)>> = HashMap::new();
+    let mut found_any = false;
+
+    for (_source, target) in worktrees {
+        let claude_dir = target.join(".claude");
+        if !claude_dir.is_dir() {
+            continue;
+        }
+        found_any = true;
+        let repo_name = target
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+
+        collect_claude_entries(
+            &claude_dir,
+            &claude_dir,
+            &repo_name,
+            &mut claude_md_parts,
+            &mut merged_allow,
+            &mut merged_deny,
+            &mut other_files,
+        )?;
+    }
+
+    if !found_any {
+        return Ok(());
+    }
+
+    let ws_claude_dir = workspace_dir.join(".claude");
+    std::fs::create_dir_all(&ws_claude_dir)?;
+
+    // Write merged CLAUDE.md
+    if !claude_md_parts.is_empty() {
+        let mut merged = String::new();
+        for (repo_name, content) in &claude_md_parts {
+            if !merged.is_empty() {
+                merged.push_str("\n\n");
+            }
+            merged.push_str(&format!("# {} (from {})\n\n", "CLAUDE.md", repo_name));
+            merged.push_str(content.trim());
+        }
+        merged.push('\n');
+        std::fs::write(ws_claude_dir.join("CLAUDE.md"), &merged)?;
+    }
+
+    // Write merged settings.local.json
+    if !merged_allow.is_empty() || !merged_deny.is_empty() {
+        let mut settings = serde_json::Map::new();
+        let mut permissions = serde_json::Map::new();
+        if !merged_allow.is_empty() {
+            merged_allow.sort();
+            merged_allow.dedup();
+            permissions.insert(
+                "allow".to_string(),
+                serde_json::Value::Array(merged_allow.into_iter().map(serde_json::Value::String).collect()),
+            );
+        }
+        if !merged_deny.is_empty() {
+            merged_deny.sort();
+            merged_deny.dedup();
+            permissions.insert(
+                "deny".to_string(),
+                serde_json::Value::Array(merged_deny.into_iter().map(serde_json::Value::String).collect()),
+            );
+        }
+        settings.insert("permissions".to_string(), serde_json::Value::Object(permissions));
+        let json = serde_json::to_string_pretty(&serde_json::Value::Object(settings))
+            .map_err(|e| Error::Config(e.to_string()))?;
+        std::fs::write(ws_claude_dir.join("settings.local.json"), format!("{}\n", json))?;
+    }
+
+    // Copy other files (including those in subdirectories)
+    for (rel_path, sources) in &other_files {
+        let dest = ws_claude_dir.join(rel_path);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if sources.len() == 1 {
+            std::fs::copy(&sources[0].1, &dest)?;
+        } else {
+            // Multiple repos have the same relative path — prefix filename with repo name
+            for (repo_name, path) in sources {
+                let file_name = rel_path.file_name().unwrap().to_string_lossy();
+                let prefixed = format!("{}.{}", repo_name, file_name);
+                let dest = dest.with_file_name(prefixed);
+                std::fs::copy(path, &dest)?;
+            }
+        }
+    }
+
+    info!(quiet, "  {} Merged .claude directories", "✓".green());
+
+    Ok(())
+}
+
+/// Recursively collect entries from a .claude directory.
+fn collect_claude_entries(
+    base: &Path,
+    dir: &Path,
+    repo_name: &str,
+    claude_md_parts: &mut Vec<(String, String)>,
+    merged_allow: &mut Vec<String>,
+    merged_deny: &mut Vec<String>,
+    other_files: &mut HashMap<PathBuf, Vec<(String, PathBuf)>>,
+) -> Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let rel_path = path.strip_prefix(base).unwrap().to_path_buf();
+
+        if path.is_dir() {
+            collect_claude_entries(base, &path, repo_name, claude_md_parts, merged_allow, merged_deny, other_files)?;
+        } else if path.is_file() {
+            let rel_str = rel_path.to_string_lossy();
+            if rel_str == "CLAUDE.md" {
+                let content = std::fs::read_to_string(&path)?;
+                claude_md_parts.push((repo_name.to_string(), content));
+            } else if rel_str == "settings.local.json" {
+                merge_settings_json(&path, merged_allow, merged_deny)?;
+            } else {
+                other_files
+                    .entry(rel_path)
+                    .or_default()
+                    .push((repo_name.to_string(), path.clone()));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn merge_settings_json(path: &Path, allow: &mut Vec<String>, deny: &mut Vec<String>) -> Result<()> {
+    let content = std::fs::read_to_string(path)?;
+    let value: serde_json::Value =
+        serde_json::from_str(&content).map_err(|e| Error::Config(e.to_string()))?;
+
+    if let Some(permissions) = value.get("permissions") {
+        if let Some(arr) = permissions.get("allow").and_then(|v| v.as_array()) {
+            for item in arr {
+                if let Some(s) = item.as_str() {
+                    allow.push(s.to_string());
+                }
+            }
+        }
+        if let Some(arr) = permissions.get("deny").and_then(|v| v.as_array()) {
+            for item in arr {
+                if let Some(s) = item.as_str() {
+                    deny.push(s.to_string());
+                }
+            }
         }
     }
 
