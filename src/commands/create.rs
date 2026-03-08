@@ -88,6 +88,11 @@ pub fn run(name: Option<&str>, base_name: Option<&str>, print: bool, open_claude
     let root = workspace_root_dir(&config);
     let workspace_dir = root.join(&name);
 
+    let branch_from = base
+        .branch_from
+        .as_deref()
+        .unwrap_or(&config.settings.default_branch_from);
+
     // Validate all repos before creating anything
     for repo in &base.repos {
         let source = PathBuf::from(&repo.path);
@@ -99,6 +104,13 @@ pub fn run(name: Option<&str>, base_name: Option<&str>, print: bool, open_claude
         }
     }
 
+    // Fetch latest from remotes
+    for repo in &base.repos {
+        let source = PathBuf::from(&repo.path);
+        info!(quiet, "  {} Fetching {}", "⟳".cyan(), repo.name.bold());
+        git::fetch(&source)?;
+    }
+
     std::fs::create_dir_all(&workspace_dir)?;
 
     let mut workspace_repos = Vec::new();
@@ -108,7 +120,7 @@ pub fn run(name: Option<&str>, base_name: Option<&str>, print: bool, open_claude
         let source = PathBuf::from(&repo.path);
         let target = workspace_dir.join(&repo.name);
 
-        match git::worktree_add(&source, &target, &name) {
+        match git::worktree_add(&source, &target, &name, Some(branch_from)) {
             Ok(()) => {
                 created_worktrees.push((source.clone(), target.clone()));
                 workspace_repos.push(WorkspaceRepo {

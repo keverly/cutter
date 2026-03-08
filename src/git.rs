@@ -12,17 +12,39 @@ pub fn is_git_repo(path: &Path) -> bool {
         .is_ok_and(|s| s.success())
 }
 
-pub fn worktree_add(source: &Path, target: &Path, branch: &str) -> Result<()> {
+pub fn fetch(source: &Path) -> Result<()> {
     let output = Command::new("git")
-        .args([
-            "-C",
-            &source.to_string_lossy(),
-            "worktree",
-            "add",
-            &target.to_string_lossy(),
-            "-b",
-            branch,
-        ])
+        .args(["-C", &source.to_string_lossy(), "fetch"])
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(Error::Git(format!(
+            "Failed to fetch in '{}': {}",
+            source.display(),
+            stderr.trim()
+        )));
+    }
+    Ok(())
+}
+
+pub fn worktree_add(source: &Path, target: &Path, branch: &str, start_point: Option<&str>) -> Result<()> {
+    let mut args = vec![
+        "-C".to_string(),
+        source.to_string_lossy().to_string(),
+        "worktree".to_string(),
+        "add".to_string(),
+        target.to_string_lossy().to_string(),
+        "-b".to_string(),
+        branch.to_string(),
+    ];
+
+    if let Some(sp) = start_point {
+        args.push(sp.to_string());
+    }
+
+    let output = Command::new("git")
+        .args(&args)
         .output()?;
 
     if !output.status.success() {

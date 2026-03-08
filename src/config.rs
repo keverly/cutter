@@ -16,12 +16,21 @@ pub struct Config {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Settings {
     pub workspace_root: String,
+
+    /// Default git ref to branch from when creating worktrees (e.g. "origin/main")
+    #[serde(default = "default_branch_from")]
+    pub default_branch_from: String,
+}
+
+fn default_branch_from() -> String {
+    "origin/main".to_string()
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
             workspace_root: "~/cutter".to_string(),
+            default_branch_from: default_branch_from(),
         }
     }
 }
@@ -29,6 +38,10 @@ impl Default for Settings {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Base {
     pub repos: Vec<RepoRef>,
+
+    /// Override the default git ref to branch from for this base
+    #[serde(default)]
+    pub branch_from: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

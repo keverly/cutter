@@ -39,7 +39,9 @@ pub fn add(name: &str, paths: &[std::path::PathBuf]) -> Result<()> {
         });
     }
 
-    config.bases.insert(name.to_string(), Base { repos });
+    config
+        .bases
+        .insert(name.to_string(), Base { repos, branch_from: None });
     config.save()?;
 
     println!("{} Base '{}' added", "✓".green(), name.bold());
