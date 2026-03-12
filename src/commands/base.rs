@@ -36,6 +36,7 @@ pub fn add(name: &str, paths: &[std::path::PathBuf]) -> Result<()> {
         repos.push(RepoRef {
             name: repo_name,
             path: canonical.to_string_lossy().to_string(),
+            branch_from: None,
         });
     }
 

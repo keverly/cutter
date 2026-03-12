@@ -89,7 +89,7 @@ pub fn run(name: Option<&str>, base_name: Option<&str>, print: bool, open_claude
     let root = workspace_root_dir(&config);
     let workspace_dir = root.join(&name);
 
-    let branch_from = base
+    let base_branch_from = base
         .branch_from
         .as_deref()
         .unwrap_or(&config.settings.default_branch_from);
@@ -120,6 +120,7 @@ pub fn run(name: Option<&str>, base_name: Option<&str>, print: bool, open_claude
     for repo in &base.repos {
         let source = PathBuf::from(&repo.path);
         let target = workspace_dir.join(&repo.name);
+        let branch_from = repo.branch_from.as_deref().unwrap_or(base_branch_from);
 
         match git::worktree_add(&source, &target, &name, Some(branch_from)) {
             Ok(()) => {

@@ -53,6 +53,10 @@ pub struct Base {
 pub struct RepoRef {
     pub name: String,
     pub path: String,
+
+    /// Override the git ref to branch from for this specific repo
+    #[serde(default)]
+    pub branch_from: Option<String>,
 }
 
 impl Config {

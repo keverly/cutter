@@ -78,6 +78,37 @@ cutter remove my-feature
 
 - `--keep-files` — remove worktrees from git but keep files on disk
 
+## Branch From
+
+By default, worktrees are created from `origin/main`. You can override this at three levels:
+
+1. **Global default** — set `default_branch_from` in `[settings]`
+2. **Per-base** — set `branch_from` on a base to override the global default for all repos in that base
+3. **Per-repo** — set `branch_from` on an individual repo entry to override both the base and global defaults
+
+Resolution order: repo `branch_from` > base `branch_from` > `settings.default_branch_from` > `origin/main`
+
+Example config:
+
+```toml
+[settings]
+workspace_root = "~/cutter"
+default_branch_from = "origin/main"
+
+[bases.my-project]
+branch_from = "origin/develop"  # all repos in this base branch from develop by default
+
+[[bases.my-project.repos]]
+name = "backend"
+path = "~/repos/backend"
+# inherits origin/develop from the base
+
+[[bases.my-project.repos]]
+name = "frontend"
+path = "~/repos/frontend"
+branch_from = "origin/main"  # this repo overrides the base and uses main
+```
+
 ## `.claude` merging
 
 When creating a workspace, cutter automatically merges the `.claude` directories from each repo into a single `.claude` directory at the workspace root. This gives Claude unified context across all repos when launched from the workspace.
