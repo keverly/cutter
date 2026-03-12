@@ -150,6 +150,11 @@ pub fn run(name: Option<&str>, base_name: Option<&str>, print: bool, open_claude
         }
     }
 
+    // Copy configured files from source repos into worktrees (e.g. .env)
+    if !base.copy_files.is_empty() {
+        copy_base_files(&base.copy_files, &base.repos, &workspace_dir, quiet)?;
+    }
+
     // Merge .claude directories from each repo into workspace root
     merge_claude_dirs(&workspace_dir, &created_worktrees, quiet)?;
 
@@ -185,6 +190,36 @@ pub fn run(name: Option<&str>, base_name: Option<&str>, print: bool, open_claude
         }
     }
 
+    Ok(())
+}
+
+/// Copy configured files from each source repo into its corresponding worktree.
+/// These are typically gitignored files (e.g. .env) that wouldn't be present in the worktree.
+fn copy_base_files(
+    copy_files: &[String],
+    repos: &[crate::config::RepoRef],
+    workspace_dir: &Path,
+    quiet: bool,
+) -> Result<()> {
+    let mut copied_any = false;
+    for repo in repos {
+        let source = PathBuf::from(&repo.path);
+        let target = workspace_dir.join(&repo.name);
+        for file in copy_files {
+            let src_path = source.join(file);
+            if src_path.exists() {
+                let dest_path = target.join(file);
+                if let Some(parent) = dest_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::copy(&src_path, &dest_path)?;
+                copied_any = true;
+            }
+        }
+    }
+    if copied_any {
+        info!(quiet, "  {} Copied extra files", "✓".green());
+    }
     Ok(())
 }
 

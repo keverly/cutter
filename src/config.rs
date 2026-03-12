@@ -42,6 +42,11 @@ pub struct Base {
     /// Override the default git ref to branch from for this base
     #[serde(default)]
     pub branch_from: Option<String>,
+
+    /// Files to copy from each source repo into its worktree (e.g. ".env", ".env.local")
+    /// These are relative paths from the repo root. Useful for gitignored files.
+    #[serde(default)]
+    pub copy_files: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
