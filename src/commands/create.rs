@@ -198,6 +198,7 @@ fn merge_claude_dirs(workspace_dir: &Path, worktrees: &[(PathBuf, PathBuf)], qui
     let mut claude_md_parts: Vec<(String, String)> = Vec::new();
     let mut merged_allow: Vec<String> = Vec::new();
     let mut merged_deny: Vec<String> = Vec::new();
+    let mut merged_mcp_servers: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
     // Maps relative path (from .claude/) -> list of (repo_name, absolute_path)
     let mut other_files: HashMap<PathBuf, Vec<(String, PathBuf)>> = HashMap::new();
     let mut found_any = false;
@@ -221,6 +222,7 @@ fn merge_claude_dirs(workspace_dir: &Path, worktrees: &[(PathBuf, PathBuf)], qui
             &mut claude_md_parts,
             &mut merged_allow,
             &mut merged_deny,
+            &mut merged_mcp_servers,
             &mut other_files,
         )?;
     }
@@ -272,6 +274,18 @@ fn merge_claude_dirs(workspace_dir: &Path, worktrees: &[(PathBuf, PathBuf)], qui
         std::fs::write(ws_claude_dir.join("settings.local.json"), format!("{}\n", json))?;
     }
 
+    // Write merged mcp.json
+    if !merged_mcp_servers.is_empty() {
+        let mut mcp = serde_json::Map::new();
+        mcp.insert(
+            "mcpServers".to_string(),
+            serde_json::Value::Object(merged_mcp_servers),
+        );
+        let json = serde_json::to_string_pretty(&serde_json::Value::Object(mcp))
+            .map_err(|e| Error::Config(e.to_string()))?;
+        std::fs::write(ws_claude_dir.join("mcp.json"), format!("{}\n", json))?;
+    }
+
     // Copy other files (including those in subdirectories)
     for (rel_path, sources) in &other_files {
         let dest = ws_claude_dir.join(rel_path);
@@ -304,6 +318,7 @@ fn collect_claude_entries(
     claude_md_parts: &mut Vec<(String, String)>,
     merged_allow: &mut Vec<String>,
     merged_deny: &mut Vec<String>,
+    merged_mcp_servers: &mut serde_json::Map<String, serde_json::Value>,
     other_files: &mut HashMap<PathBuf, Vec<(String, PathBuf)>>,
 ) -> Result<()> {
     for entry in std::fs::read_dir(dir)? {
@@ -312,7 +327,7 @@ fn collect_claude_entries(
         let rel_path = path.strip_prefix(base).unwrap().to_path_buf();
 
         if path.is_dir() {
-            collect_claude_entries(base, &path, repo_name, claude_md_parts, merged_allow, merged_deny, other_files)?;
+            collect_claude_entries(base, &path, repo_name, claude_md_parts, merged_allow, merged_deny, merged_mcp_servers, other_files)?;
         } else if path.is_file() {
             let rel_str = rel_path.to_string_lossy();
             if rel_str == "CLAUDE.md" {
@@ -320,6 +335,8 @@ fn collect_claude_entries(
                 claude_md_parts.push((repo_name.to_string(), content));
             } else if rel_str == "settings.local.json" {
                 merge_settings_json(&path, merged_allow, merged_deny)?;
+            } else if rel_str == "mcp.json" {
+                merge_mcp_json(&path, repo_name, merged_mcp_servers)?;
             } else {
                 other_files
                     .entry(rel_path)
@@ -328,6 +345,30 @@ fn collect_claude_entries(
             }
         }
     }
+    Ok(())
+}
+
+fn merge_mcp_json(
+    path: &Path,
+    repo_name: &str,
+    servers: &mut serde_json::Map<String, serde_json::Value>,
+) -> Result<()> {
+    let content = std::fs::read_to_string(path)?;
+    let value: serde_json::Value =
+        serde_json::from_str(&content).map_err(|e| Error::Config(e.to_string()))?;
+
+    if let Some(mcp_servers) = value.get("mcpServers").and_then(|v| v.as_object()) {
+        for (name, config) in mcp_servers {
+            let key = if servers.contains_key(name) {
+                // Conflict: prefix with repo name to avoid overwriting
+                format!("{}/{}", repo_name, name)
+            } else {
+                name.clone()
+            };
+            servers.insert(key, config.clone());
+        }
+    }
+
     Ok(())
 }
 
