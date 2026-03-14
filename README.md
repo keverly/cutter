@@ -120,11 +120,44 @@ When creating a workspace, cutter automatically merges the `.claude` directories
 
 If no repos contain a `.claude` directory, the step is skipped.
 
+### Per-base `.claude` directory
+
+You can customize the merged `.claude` directory on a per-base level by placing files in `~/.config/cutter/bases/<base-name>/.claude/`. This directory is overlaid on top of the repo-merged result, so base files take priority.
+
+Merge behavior:
+
+- **`CLAUDE.md`** — base content is appended after the repo-merged content (with a `# CLAUDE.md (from base)` header)
+- **`settings.local.json`** — base allow/deny entries are merged into the repo-merged ones
+- **`mcp.json`** — base MCP servers are merged in; base servers override same-named repo servers
+- **Other files** — base files overwrite repo-merged files at the same relative path
+
+Example:
+
+```sh
+# Create a base .claude directory
+mkdir -p ~/.config/cutter/bases/platform/.claude
+
+# Add base-level instructions
+echo "Always run tests before committing." > ~/.config/cutter/bases/platform/.claude/CLAUDE.md
+
+# Add base-level MCP servers
+cat > ~/.config/cutter/bases/platform/.claude/mcp.json << 'EOF'
+{ "mcpServers": { "my-server": { "command": "my-server" } } }
+EOF
+```
+
+If the base `.claude` directory doesn't exist, the step is skipped.
+
 ## Data Layout
 
 ```
 ~/.config/cutter/
 ├── config.toml              # Base definitions + settings
+├── bases/
+│   └── platform/            # Per-base overrides (optional)
+│       └── .claude/
+│           ├── CLAUDE.md
+│           └── mcp.json
 └── workspaces/
     └── my-feature.toml      # Per-workspace state
 

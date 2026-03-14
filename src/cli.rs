@@ -1,6 +1,13 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ClaudeMode {
+    None,
+    Normal,
+    DangerouslySkipPermissions,
+}
+
 #[derive(Parser)]
 #[command(name = "cutter", about = "Git worktree workspace manager")]
 pub struct Cli {
@@ -32,6 +39,10 @@ pub enum Command {
         /// Launch claude in workspace dir after creation
         #[arg(long, group = "open_mode")]
         open_claude: bool,
+
+        /// Launch claude with --dangerously-skip-permissions in workspace dir after creation
+        #[arg(long, group = "open_mode")]
+        open_claude_dangerous: bool,
     },
 
     /// List all workspaces
@@ -63,6 +74,10 @@ pub enum Command {
     OpenClaude {
         /// Workspace name
         name: String,
+
+        /// Use --dangerously-skip-permissions
+        #[arg(long)]
+        dangerous: bool,
     },
 }
 

@@ -6,7 +6,7 @@ mod git;
 mod workspace;
 
 use clap::Parser;
-use cli::{BaseCommand, Cli, Command};
+use cli::{BaseCommand, Cli, ClaudeMode, Command};
 use colored::Colorize;
 
 fn main() {
@@ -23,7 +23,17 @@ fn main() {
             base,
             print,
             open_claude,
-        } => commands::create::run(name.as_deref(), base.as_deref(), print, open_claude),
+            open_claude_dangerous,
+        } => {
+            let claude_mode = if open_claude_dangerous {
+                ClaudeMode::DangerouslySkipPermissions
+            } else if open_claude {
+                ClaudeMode::Normal
+            } else {
+                ClaudeMode::None
+            };
+            commands::create::run(name.as_deref(), base.as_deref(), print, claude_mode)
+        }
         Command::List => commands::list::run(),
         Command::Status { name } => {
             let name = match name {
@@ -36,8 +46,15 @@ fn main() {
             commands::status::run(&name)
         }
         Command::Remove { name, keep_files } => commands::remove::run(&name, keep_files),
-        Command::Locate { name } => commands::open::run(&name, false),
-        Command::OpenClaude { name } => commands::open::run(&name, true),
+        Command::Locate { name } => commands::open::run(&name, ClaudeMode::None),
+        Command::OpenClaude { name, dangerous } => {
+            let mode = if dangerous {
+                ClaudeMode::DangerouslySkipPermissions
+            } else {
+                ClaudeMode::Normal
+            };
+            commands::open::run(&name, mode)
+        }
     };
 
     if let Err(e) = result {

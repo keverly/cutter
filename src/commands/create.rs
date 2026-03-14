@@ -1,9 +1,10 @@
 use chrono::Utc;
 use colored::Colorize;
-use dialoguer::{Confirm, Input, Select};
+use dialoguer::{Input, Select};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::cli::ClaudeMode;
 use crate::config::{Config, workspace_root_dir};
 use crate::error::{Error, Result};
 use crate::git;
@@ -19,7 +20,7 @@ macro_rules! info {
     };
 }
 
-pub fn run(name: Option<&str>, base_name: Option<&str>, print: bool, open_claude: bool) -> Result<()> {
+pub fn run(name: Option<&str>, base_name: Option<&str>, print: bool, claude_mode: ClaudeMode) -> Result<()> {
     let quiet = print;
     let config = Config::load()?;
     let interactive = name.is_none() || base_name.is_none();
@@ -67,14 +68,21 @@ pub fn run(name: Option<&str>, base_name: Option<&str>, print: bool, open_claude
         }
     };
 
-    let open_claude = if interactive && !open_claude && !print {
-        Confirm::new()
+    let claude_mode = if interactive && claude_mode == ClaudeMode::None && !print {
+        let items = &["No", "Claude", "Claude (--dangerously-skip-permissions)"];
+        let selection = Select::new()
             .with_prompt("Open with Claude after creation?")
-            .default(false)
+            .items(items)
+            .default(0)
             .interact()
-            .map_err(|e| Error::Git(e.to_string()))?
+            .map_err(|e| Error::Git(e.to_string()))?;
+        match selection {
+            1 => ClaudeMode::Normal,
+            2 => ClaudeMode::DangerouslySkipPermissions,
+            _ => ClaudeMode::None,
+        }
     } else {
-        open_claude
+        claude_mode
     };
 
     let base = config
@@ -159,6 +167,9 @@ pub fn run(name: Option<&str>, base_name: Option<&str>, print: bool, open_claude
     // Merge .claude directories from each repo into workspace root
     merge_claude_dirs(&workspace_dir, &created_worktrees, quiet)?;
 
+    // Overlay base-level .claude directory on top of merged result
+    overlay_base_claude_dir(&workspace_dir, &base_name, quiet)?;
+
     let ws_config = WorkspaceConfig {
         workspace: WorkspaceInfo {
             name: name.to_string(),
@@ -182,13 +193,25 @@ pub fn run(name: Option<&str>, base_name: Option<&str>, print: bool, open_claude
     if print {
         println!("{}", workspace_dir.display());
     }
-    if open_claude {
-        let status = std::process::Command::new("claude")
-            .current_dir(&workspace_dir)
-            .status()?;
-        if !status.success() {
-            return Err(Error::Git("claude exited with non-zero status".into()));
+    match claude_mode {
+        ClaudeMode::Normal => {
+            let status = std::process::Command::new("claude")
+                .current_dir(&workspace_dir)
+                .status()?;
+            if !status.success() {
+                return Err(Error::Git("claude exited with non-zero status".into()));
+            }
         }
+        ClaudeMode::DangerouslySkipPermissions => {
+            let status = std::process::Command::new("claude")
+                .arg("--dangerously-skip-permissions")
+                .current_dir(&workspace_dir)
+                .status()?;
+            if !status.success() {
+                return Err(Error::Git("claude exited with non-zero status".into()));
+            }
+        }
+        ClaudeMode::None => {}
     }
 
     Ok(())
@@ -343,6 +366,139 @@ fn merge_claude_dirs(workspace_dir: &Path, worktrees: &[(PathBuf, PathBuf)], qui
 
     info!(quiet, "  {} Merged .claude directories", "✓".green());
 
+    Ok(())
+}
+
+/// Overlay a base-level .claude directory on top of the already-merged workspace .claude.
+///
+/// The base .claude dir lives at `~/.config/cutter/bases/<base_name>/.claude/`.
+/// - CLAUDE.md: appended after repo-merged content
+/// - settings.local.json: allow/deny entries merged into existing
+/// - mcp.json: servers merged; base servers override same-named repo servers
+/// - Other files: copied directly (overwrite on conflict)
+fn overlay_base_claude_dir(workspace_dir: &Path, base_name: &str, quiet: bool) -> Result<()> {
+    let base_claude_dir = crate::config::config_dir()?.join("bases").join(base_name).join(".claude");
+    if !base_claude_dir.is_dir() {
+        return Ok(());
+    }
+
+    let ws_claude_dir = workspace_dir.join(".claude");
+    std::fs::create_dir_all(&ws_claude_dir)?;
+
+    overlay_base_claude_dir_recursive(&base_claude_dir, &base_claude_dir, &ws_claude_dir)?;
+
+    info!(quiet, "  {} Applied base .claude directory", "✓".green());
+    Ok(())
+}
+
+/// Recursively walk the base .claude dir and overlay files onto the workspace .claude dir.
+fn overlay_base_claude_dir_recursive(
+    base_root: &Path,
+    current_dir: &Path,
+    ws_claude_dir: &Path,
+) -> Result<()> {
+    for entry in std::fs::read_dir(current_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let rel_path = path.strip_prefix(base_root).unwrap();
+
+        if path.is_dir() {
+            overlay_base_claude_dir_recursive(base_root, &path, ws_claude_dir)?;
+        } else if path.is_file() {
+            let rel_str = rel_path.to_string_lossy();
+            let dest = ws_claude_dir.join(rel_path);
+
+            if rel_str == "CLAUDE.md" {
+                // Append base CLAUDE.md content after existing
+                let base_content = std::fs::read_to_string(&path)?;
+                let mut merged = String::new();
+                if dest.exists() {
+                    merged = std::fs::read_to_string(&dest)?;
+                    if !merged.ends_with('\n') {
+                        merged.push('\n');
+                    }
+                    merged.push('\n');
+                }
+                merged.push_str(&format!("# CLAUDE.md (from base)\n\n"));
+                merged.push_str(base_content.trim());
+                merged.push('\n');
+                std::fs::write(&dest, &merged)?;
+            } else if rel_str == "settings.local.json" {
+                // Merge base settings into existing
+                let mut allow = Vec::new();
+                let mut deny = Vec::new();
+
+                // Read existing workspace settings first
+                if dest.exists() {
+                    merge_settings_json(&dest, &mut allow, &mut deny)?;
+                }
+                // Merge base settings on top
+                merge_settings_json(&path, &mut allow, &mut deny)?;
+
+                // Write merged result
+                allow.sort();
+                allow.dedup();
+                deny.sort();
+                deny.dedup();
+
+                let mut settings = serde_json::Map::new();
+                let mut permissions = serde_json::Map::new();
+                if !allow.is_empty() {
+                    permissions.insert(
+                        "allow".to_string(),
+                        serde_json::Value::Array(allow.into_iter().map(serde_json::Value::String).collect()),
+                    );
+                }
+                if !deny.is_empty() {
+                    permissions.insert(
+                        "deny".to_string(),
+                        serde_json::Value::Array(deny.into_iter().map(serde_json::Value::String).collect()),
+                    );
+                }
+                settings.insert("permissions".to_string(), serde_json::Value::Object(permissions));
+                let json = serde_json::to_string_pretty(&serde_json::Value::Object(settings))
+                    .map_err(|e| Error::Config(e.to_string()))?;
+                std::fs::write(&dest, format!("{}\n", json))?;
+            } else if rel_str == "mcp.json" {
+                // Merge base MCP servers; base wins on conflict
+                let mut servers = serde_json::Map::new();
+
+                // Read existing workspace mcp.json first
+                if dest.exists() {
+                    let content = std::fs::read_to_string(&dest)?;
+                    let value: serde_json::Value =
+                        serde_json::from_str(&content).map_err(|e| Error::Config(e.to_string()))?;
+                    if let Some(mcp_servers) = value.get("mcpServers").and_then(|v| v.as_object()) {
+                        for (name, config) in mcp_servers {
+                            servers.insert(name.clone(), config.clone());
+                        }
+                    }
+                }
+
+                // Read base mcp.json — base servers overwrite same-named entries
+                let base_content = std::fs::read_to_string(&path)?;
+                let base_value: serde_json::Value =
+                    serde_json::from_str(&base_content).map_err(|e| Error::Config(e.to_string()))?;
+                if let Some(mcp_servers) = base_value.get("mcpServers").and_then(|v| v.as_object()) {
+                    for (name, config) in mcp_servers {
+                        servers.insert(name.clone(), config.clone());
+                    }
+                }
+
+                let mut mcp = serde_json::Map::new();
+                mcp.insert("mcpServers".to_string(), serde_json::Value::Object(servers));
+                let json = serde_json::to_string_pretty(&serde_json::Value::Object(mcp))
+                    .map_err(|e| Error::Config(e.to_string()))?;
+                std::fs::write(&dest, format!("{}\n", json))?;
+            } else {
+                // Other files: copy directly, overwriting if exists
+                if let Some(parent) = dest.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::copy(&path, &dest)?;
+            }
+        }
+    }
     Ok(())
 }
 
