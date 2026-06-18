@@ -34,6 +34,9 @@ pub fn run(name: Option<&str>, base_name: Option<&str>, print: bool, claude_mode
                     if input.trim().is_empty() {
                         return Err("Name cannot be empty".into());
                     }
+                    if input.chars().any(|c| c.is_whitespace()) {
+                        return Err("Name cannot contain whitespace".into());
+                    }
                     if WorkspaceConfig::exists(input).unwrap_or(false) {
                         return Err(format!("Workspace '{}' already exists", input));
                     }
@@ -89,6 +92,12 @@ pub fn run(name: Option<&str>, base_name: Option<&str>, print: bool, claude_mode
         .bases
         .get(&base_name)
         .ok_or_else(|| Error::BaseNotFound(base_name.to_string()))?;
+
+    if name.chars().any(|c| c.is_whitespace()) {
+        return Err(Error::InvalidWorkspaceName(
+            "name cannot contain whitespace".into(),
+        ));
+    }
 
     if WorkspaceConfig::exists(&name)? {
         return Err(Error::WorkspaceAlreadyExists(name.clone()));

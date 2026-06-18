@@ -14,6 +14,9 @@ pub enum Error {
     #[error("Workspace '{0}' not found")]
     WorkspaceNotFound(String),
 
+    #[error("Invalid workspace name: {0}")]
+    InvalidWorkspaceName(String),
+
     #[error("Path is not a git repository: {0}")]
     NotAGitRepo(PathBuf),
 
