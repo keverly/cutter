@@ -30,6 +30,34 @@ git pull
 cargo install --path .
 ```
 
+## GUI (Cutter.app)
+
+Cutter ships an optional standalone macOS app that lists your active
+workspaces and shows your base configurations. It's built separately from the
+CLI so the CLI stays lean.
+
+```sh
+# Build a double-clickable dist/Cutter.app
+./scripts/build-app.sh
+
+# Run it, or install it to /Applications
+open dist/Cutter.app
+cp -r dist/Cutter.app /Applications/
+```
+
+The window has two tabs:
+
+- **Workspaces** — every active workspace; click one to select it and view its
+  base, branch, path, and per-repo worktrees.
+- **Settings** — the workspace root, default branch-from, and each base with
+  its repos, `branch_from`, and `copy_files`.
+
+Use **⟳ Refresh** to re-read workspaces and config from disk.
+
+> The GUI reads the same `~/.config/cutter` data the CLI writes — it does not
+> modify anything yet. To run it without bundling, use
+> `cargo run --features gui --bin cutter-gui`.
+
 ## Quick Start
 
 ```sh

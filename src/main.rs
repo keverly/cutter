@@ -1,13 +1,7 @@
-mod cli;
-mod commands;
-mod config;
-mod error;
-mod git;
-mod workspace;
-
 use clap::Parser;
-use cli::{BaseCommand, Cli, ClaudeMode, Command};
 use colored::Colorize;
+use cutter::cli::{BaseCommand, Cli, ClaudeMode, Command};
+use cutter::commands;
 
 fn main() {
     let cli = Cli::parse();

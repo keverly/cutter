@@ -15,3 +15,15 @@ tabled = "0.17"
 chrono = { version = "0.4", features = ["serde"] }
 dialoguer = "0.11"
 serde_json = "1"
+eframe = { version = "0.31", optional = true }
+notify-debouncer-mini = { version = "0.7.0", optional = true }
+
+[features]
+# Builds the standalone Cutter.app GUI (the `cutter-gui` binary).
+gui = ["dep:eframe", "dep:notify-debouncer-mini"]
+
+# The default CLI binary stays lean; the GUI is opt-in behind `--features gui`.
+[[bin]]
+name = "cutter-gui"
+path = "src/bin/cutter-gui.rs"
+required-features = ["gui"]
