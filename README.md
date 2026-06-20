@@ -48,15 +48,21 @@ cp -r dist/Cutter.app /Applications/
 The window has two tabs:
 
 - **Workspaces** — every active workspace; click one to select it and view its
-  base, branch, path, and per-repo worktrees.
+  base, branch, path, and per-repo worktrees. Use **➕ New** to create a
+  workspace from a base, and **🗑 Remove** to tear one down.
 - **Settings** — the workspace root, default branch-from, and each base with
-  its repos, `branch_from`, and `copy_files`.
+  its repos, `branch_from`, and `copy_files`. Use **➕ New base** to define one
+  (browse for repo folders or type paths), and **Remove** to delete a base
+  definition.
 
-Use **⟳ Refresh** to re-read workspaces and config from disk.
+Creating and removing run the same logic as the CLI commands, on a background
+thread so the window stays responsive during `git fetch`/worktree work; a
+status bar shows progress and the result. Destructive actions ask for
+confirmation first. The list auto-refreshes when `~/.config/cutter` changes, or
+use **⟳ Refresh** to re-read manually.
 
-> The GUI reads the same `~/.config/cutter` data the CLI writes — it does not
-> modify anything yet. To run it without bundling, use
-> `cargo run --features gui --bin cutter-gui`.
+> The GUI reads and writes the same `~/.config/cutter` data the CLI uses. To run
+> it without bundling, use `cargo run --features gui --bin cutter-gui`.
 
 ## Quick Start
 
