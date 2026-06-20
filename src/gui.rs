@@ -10,7 +10,8 @@ use notify_debouncer_mini::{new_debouncer, DebounceEventResult, Debouncer};
 use crate::cli::ClaudeMode;
 use crate::commands;
 use crate::config::{config_dir, expand_tilde, Base, Config};
-use crate::workspace::WorkspaceConfig;
+use crate::window_manager::{self, WindowInfo};
+use crate::workspace::{LinkedWindow, WorkspaceConfig};
 
 /// Launch the standalone Cutter GUI window.
 pub fn run() -> eframe::Result<()> {
@@ -125,6 +126,14 @@ struct CutterApp {
     // Pending "are you sure?" for a destructive action.
     confirm_remove: Option<RemoveTarget>,
 
+    // "Link windows" modal: which workspace, the enumerated candidates, and
+    // which are checked. `ax_trusted` is snapshotted when the modal opens.
+    show_link_windows: bool,
+    link_for: Option<String>,
+    link_candidates: Vec<WindowInfo>,
+    link_checked: Vec<bool>,
+    ax_trusted: bool,
+
     // Background work. Create/remove shell out to git (fetch can be slow), so
     // they run off the UI thread; `job_rx` delivers the outcome back.
     job: Option<RunningJob>,
@@ -156,6 +165,11 @@ impl CutterApp {
             new_ws_name: String::new(),
             new_ws_base: None,
             confirm_remove: None,
+            show_link_windows: false,
+            link_for: None,
+            link_candidates: Vec::new(),
+            link_checked: Vec::new(),
+            ax_trusted: false,
             job: None,
             job_rx: None,
             status: None,
@@ -277,6 +291,11 @@ impl CutterApp {
     fn workspaces_ui(&mut self, ctx: &egui::Context) {
         let job_active = self.job.is_some();
         let mut want_remove_ws: Option<String> = None;
+        // A list item was clicked this frame → raise that workspace's windows.
+        let mut raise_request: Option<String> = None;
+        // Detail-pane intents for the selected workspace.
+        let mut open_link = false;
+        let mut unlink_idx: Option<usize> = None;
 
         egui::SidePanel::left("workspace_list")
             .resizable(true)
@@ -317,15 +336,35 @@ impl CutterApp {
                         self.workspaces.iter().map(|w| w.workspace.name.clone()).collect();
                     for name in names {
                         let is_selected = self.selected.as_deref() == Some(name.as_str());
-                        if ui.selectable_label(is_selected, name.as_str()).clicked() {
-                            self.selected = Some(name);
+                        // Show a small ⧉ marker on workspaces that have links.
+                        let has_links = self
+                            .workspaces
+                            .iter()
+                            .find(|w| w.workspace.name == name)
+                            .is_some_and(|w| !w.linked_windows.is_empty());
+                        let label = if has_links {
+                            format!("⧉  {name}")
+                        } else {
+                            name.clone()
+                        };
+                        if ui.selectable_label(is_selected, label).clicked() {
+                            self.selected = Some(name.clone());
+                            // Clicking activates the workspace's linked windows.
+                            raise_request = Some(name);
                         }
                     }
                 });
             });
 
         egui::CentralPanel::default().show(ctx, |ui| match self.selected_workspace() {
-            Some(ws) => Self::workspace_details(ui, ws, job_active, &mut want_remove_ws),
+            Some(ws) => Self::workspace_details(
+                ui,
+                ws,
+                job_active,
+                &mut want_remove_ws,
+                &mut open_link,
+                &mut unlink_idx,
+            ),
             None => {
                 ui.centered_and_justified(|ui| {
                     ui.label(egui::RichText::new("Select a workspace").weak());
@@ -336,6 +375,19 @@ impl CutterApp {
         if let Some(name) = want_remove_ws {
             self.confirm_remove = Some(RemoveTarget::Workspace(name));
         }
+        if open_link {
+            if let Some(name) = self.selected.clone() {
+                self.open_link_windows(name);
+            }
+        }
+        if let Some(idx) = unlink_idx {
+            if let Some(name) = self.selected.clone() {
+                self.unlink_window(&name, idx);
+            }
+        }
+        if let Some(name) = raise_request {
+            self.activate_workspace(&name);
+        }
     }
 
     fn workspace_details(
@@ -343,6 +395,8 @@ impl CutterApp {
         ws: &WorkspaceConfig,
         job_active: bool,
         want_remove: &mut Option<String>,
+        open_link: &mut bool,
+        unlink_idx: &mut Option<usize>,
     ) {
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.add_space(6.0);
@@ -395,6 +449,50 @@ impl CutterApp {
                         ui.label(egui::RichText::new(repo.worktree_path.as_str()).monospace());
                         ui.end_row();
                     });
+            }
+
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("Linked windows ({})", ws.linked_windows.len()))
+                        .strong(),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .button("⧉ Link windows…")
+                        .on_hover_text("Tie macOS windows to this workspace")
+                        .clicked()
+                    {
+                        *open_link = true;
+                    }
+                });
+            });
+            ui.separator();
+
+            if ws.linked_windows.is_empty() {
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(
+                        "None. Click this workspace to bring its linked windows forward.",
+                    )
+                    .weak(),
+                );
+            } else {
+                for (i, link) in ws.linked_windows.iter().enumerate() {
+                    ui.add_space(2.0);
+                    ui.horizontal(|ui| {
+                        if ui.small_button("✕").on_hover_text("Unlink").clicked() {
+                            *unlink_idx = Some(i);
+                        }
+                        ui.label(egui::RichText::new(link.app_name.as_str()).strong());
+                        let title = if link.title.is_empty() {
+                            "(untitled)".to_string()
+                        } else {
+                            link.title.clone()
+                        };
+                        ui.label(egui::RichText::new(title).weak());
+                    });
+                }
             }
         });
     }
@@ -517,6 +615,243 @@ impl CutterApp {
         self.show_new_workspace = true;
         if self.new_ws_base.is_none() {
             self.new_ws_base = self.bases.keys().next().cloned();
+        }
+    }
+
+    /// Open the "Link windows" modal for `ws_name`, snapshotting the live
+    /// windows and pre-checking the ones already linked.
+    fn open_link_windows(&mut self, ws_name: String) {
+        self.ax_trusted = window_manager::accessibility_trusted(false);
+        self.link_candidates = if self.ax_trusted {
+            window_manager::list_windows()
+        } else {
+            Vec::new()
+        };
+        let existing: Vec<LinkedWindow> = self
+            .workspaces
+            .iter()
+            .find(|w| w.workspace.name == ws_name)
+            .map(|w| w.linked_windows.clone())
+            .unwrap_or_default();
+        self.link_checked = self
+            .link_candidates
+            .iter()
+            .map(|c| existing.iter().any(|l| c.matches(l)))
+            .collect();
+        self.link_for = Some(ws_name);
+        self.show_link_windows = true;
+    }
+
+    /// Re-enumerate windows for the open modal (e.g. after granting permission).
+    fn refresh_link_candidates(&mut self) {
+        self.ax_trusted = window_manager::accessibility_trusted(false);
+        let existing: Vec<LinkedWindow> = self
+            .link_for
+            .as_ref()
+            .and_then(|name| self.workspaces.iter().find(|w| &w.workspace.name == name))
+            .map(|w| w.linked_windows.clone())
+            .unwrap_or_default();
+        self.link_candidates = if self.ax_trusted {
+            window_manager::list_windows()
+        } else {
+            Vec::new()
+        };
+        self.link_checked = self
+            .link_candidates
+            .iter()
+            .map(|c| existing.iter().any(|l| c.matches(l)))
+            .collect();
+    }
+
+    /// Persist a workspace's full set of linked windows.
+    fn save_links(&mut self, ws_name: &str, links: Vec<LinkedWindow>) {
+        let result = WorkspaceConfig::load(ws_name).and_then(|mut ws| {
+            ws.linked_windows = links;
+            ws.save()
+        });
+        match result {
+            Ok(()) => {
+                self.status = Some(StatusMsg {
+                    ok: true,
+                    text: format!("Updated linked windows for '{ws_name}'"),
+                });
+                self.reload();
+            }
+            Err(e) => {
+                self.status = Some(StatusMsg {
+                    ok: false,
+                    text: e.to_string(),
+                });
+            }
+        }
+    }
+
+    /// Remove the link at `idx` from a workspace.
+    fn unlink_window(&mut self, ws_name: &str, idx: usize) {
+        let Some(ws) = self.workspaces.iter().find(|w| w.workspace.name == ws_name) else {
+            return;
+        };
+        let mut links = ws.linked_windows.clone();
+        if idx < links.len() {
+            links.remove(idx);
+            self.save_links(ws_name, links);
+        }
+    }
+
+    /// Raise the linked windows of `ws_name`, reporting any that didn't resolve.
+    fn activate_workspace(&mut self, ws_name: &str) {
+        let Some(ws) = self.workspaces.iter().find(|w| w.workspace.name == ws_name) else {
+            return;
+        };
+        if ws.linked_windows.is_empty() {
+            return;
+        }
+        let links = ws.linked_windows.clone();
+        let report = window_manager::raise_windows(&links);
+        if !report.unresolved.is_empty() {
+            self.status = Some(StatusMsg {
+                ok: false,
+                text: format!(
+                    "Raised {} window(s); couldn't find: {}",
+                    report.raised,
+                    report.unresolved.join(", ")
+                ),
+            });
+        }
+    }
+
+    /// Modal listing open windows so the user can tie a multi-selection to the
+    /// workspace. Shows a permission gate when Accessibility access is missing.
+    fn link_windows_window(&mut self, ctx: &egui::Context) {
+        if !self.show_link_windows {
+            return;
+        }
+        let ws_name = self.link_for.clone().unwrap_or_default();
+        let mut close = false;
+        let mut do_save = false;
+        let mut do_refresh = false;
+        let mut request_permission = false;
+
+        egui::Window::new(format!("Link windows · {ws_name}"))
+            .collapsible(false)
+            .resizable(true)
+            .default_width(520.0)
+            .default_height(420.0)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                if !self.ax_trusted {
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new("Cutter needs Accessibility access").strong(),
+                    );
+                    ui.label(
+                        "To see and raise other apps' windows, allow Cutter under \
+                         System Settings ▸ Privacy & Security ▸ Accessibility.",
+                    );
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Open Accessibility Settings").clicked() {
+                            request_permission = true;
+                        }
+                        if ui.button("Re-check").clicked() {
+                            do_refresh = true;
+                        }
+                    });
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.button("Close").clicked() {
+                            close = true;
+                        }
+                    });
+                    return;
+                }
+
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Select windows to tie to this workspace").weak(),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("⟳ Rescan").clicked() {
+                            do_refresh = true;
+                        }
+                    });
+                });
+                ui.separator();
+
+                if self.link_candidates.is_empty() {
+                    ui.add_space(6.0);
+                    ui.label("No linkable windows found. Open the apps you want, then Rescan.");
+                } else {
+                    egui::ScrollArea::vertical()
+                        .max_height(280.0)
+                        .show(ui, |ui| {
+                            for (i, win) in self.link_candidates.iter().enumerate() {
+                                let checked = &mut self.link_checked[i];
+                                let title = if win.title.is_empty() {
+                                    "(untitled)".to_string()
+                                } else {
+                                    win.title.clone()
+                                };
+                                ui.horizontal(|ui| {
+                                    ui.checkbox(checked, "");
+                                    ui.label(egui::RichText::new(win.app_name.as_str()).strong());
+                                    ui.label(egui::RichText::new(title).weak());
+                                });
+                                if let Some(doc) = &win.document_path {
+                                    ui.label(
+                                        egui::RichText::new(format!("    {doc}"))
+                                            .monospace()
+                                            .weak()
+                                            .small(),
+                                    );
+                                }
+                            }
+                        });
+                }
+
+                ui.add_space(8.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    let n = self.link_checked.iter().filter(|c| **c).count();
+                    if ui
+                        .button(format!("Save ({n})"))
+                        .on_hover_text("Replace this workspace's linked windows")
+                        .clicked()
+                    {
+                        do_save = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        close = true;
+                    }
+                });
+            });
+
+        if request_permission {
+            // Triggers the system prompt; user grants in System Settings.
+            window_manager::accessibility_trusted(true);
+            window_manager::open_accessibility_settings();
+        }
+        if do_refresh {
+            self.refresh_link_candidates();
+        }
+        if do_save {
+            let links: Vec<LinkedWindow> = self
+                .link_candidates
+                .iter()
+                .zip(&self.link_checked)
+                .filter(|(_, checked)| **checked)
+                .map(|(win, _)| win.to_link())
+                .collect();
+            self.save_links(&ws_name, links);
+            close = true;
+        }
+        if close {
+            self.show_link_windows = false;
+            self.link_for = None;
+            self.link_candidates.clear();
+            self.link_checked.clear();
         }
     }
 
@@ -849,6 +1184,7 @@ impl eframe::App for CutterApp {
         self.new_base_window(ctx, &mut action);
         self.new_workspace_window(ctx, &mut action);
         self.confirm_window(ctx, &mut action);
+        self.link_windows_window(ctx);
         if let Some(action) = action {
             self.dispatch(ctx, action);
         }

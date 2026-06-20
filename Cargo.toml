@@ -19,9 +19,27 @@ eframe = { version = "0.31", optional = true }
 notify-debouncer-mini = { version = "0.7.0", optional = true }
 rfd = { version = "0.15", optional = true }
 
+# Window linking (GUI, macOS only): enumerate and raise other apps' windows via
+# the Accessibility API, ordered front-to-back via the CoreGraphics window list.
+# These are macOS-only crates; the GUI itself is a macOS app, so the `gui`
+# feature is only ever built on macOS. The code that uses them is additionally
+# gated on `target_os = "macos"` with a stub fallback.
+accessibility-sys = { version = "0.1", optional = true }
+core-foundation = { version = "0.10", optional = true }
+core-foundation-sys = { version = "0.8", optional = true }
+core-graphics = { version = "0.24", optional = true }
+
 [features]
 # Builds the standalone Cutter.app GUI (the `cutter-gui` binary).
-gui = ["dep:eframe", "dep:notify-debouncer-mini", "dep:rfd"]
+gui = [
+    "dep:eframe",
+    "dep:notify-debouncer-mini",
+    "dep:rfd",
+    "dep:accessibility-sys",
+    "dep:core-foundation",
+    "dep:core-foundation-sys",
+    "dep:core-graphics",
+]
 
 # The default CLI binary stays lean; the GUI is opt-in behind `--features gui`.
 [[bin]]

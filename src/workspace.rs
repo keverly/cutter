@@ -9,6 +9,29 @@ use crate::error::{Error, Result};
 pub struct WorkspaceConfig {
     pub workspace: WorkspaceInfo,
     pub repos: Vec<WorkspaceRepo>,
+
+    /// macOS windows the user has tied to this workspace. Stored as stable
+    /// descriptors (live window IDs are ephemeral) and re-resolved against the
+    /// running windows when the workspace is activated. See `window_manager`.
+    #[serde(default)]
+    pub linked_windows: Vec<LinkedWindow>,
+}
+
+/// A descriptor for a macOS window linked to a workspace.
+///
+/// Live window handles don't survive app restarts, so we persist identifying
+/// attributes and match them back to a real window at activation time:
+/// `document_path` (e.g. Xcode's open project) is the strongest signal, with
+/// the window `title` as a fallback.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LinkedWindow {
+    /// Owning application name, e.g. "Xcode" (CoreGraphics owner name).
+    pub app_name: String,
+    /// Window title at link time, used for display and fallback matching.
+    pub title: String,
+    /// Document/file path the window has open, if the app exposes one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document_path: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

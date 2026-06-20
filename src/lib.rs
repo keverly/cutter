@@ -7,3 +7,6 @@ pub mod workspace;
 
 #[cfg(feature = "gui")]
 pub mod gui;
+
+#[cfg(feature = "gui")]
+pub mod window_manager;

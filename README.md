@@ -64,6 +64,30 @@ use **⟳ Refresh** to re-read manually.
 > The GUI reads and writes the same `~/.config/cutter` data the CLI uses. To run
 > it without bundling, use `cargo run --features gui --bin cutter-gui`.
 
+### Linking macOS windows to a workspace
+
+You can tie real macOS windows to a workspace and bring them forward with one
+click — useful when you keep, say, an Xcode window and its Simulator per
+workspace (including two windows of the *same* app for different workspaces).
+
+- In a workspace's detail pane, click **⧉ Link windows…**. Pick any open windows
+  from the list (multi-select — e.g. Xcode *and* the Simulator) and **Save**.
+  Workspaces with links show a `⧉` marker in the list.
+- **Click the workspace** to raise its linked windows to the foreground. The ✕
+  next to a link removes it.
+
+Links are stored per-workspace (in its `.toml`) as stable descriptors — the app
+name, window title, and the open document path when the app exposes one (e.g.
+Xcode) — and re-resolved against live windows each time, so they keep working
+after you quit and reopen an app. If a window can't be found, the status bar
+says which.
+
+This uses the macOS **Accessibility API**, so the first time you open the link
+picker macOS will ask you to allow Cutter under **System Settings ▸ Privacy &
+Security ▸ Accessibility** (the picker has a button that opens the pane). The
+app is ad-hoc signed by `build-app.sh`; because that isn't a Developer ID
+signature, macOS may ask you to re-grant Accessibility after each rebuild.
+
 ## Quick Start
 
 ```sh

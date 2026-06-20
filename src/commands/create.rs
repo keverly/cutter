@@ -188,6 +188,7 @@ pub fn run(name: Option<&str>, base_name: Option<&str>, print: bool, claude_mode
             created_at: Utc::now(),
         },
         repos: workspace_repos,
+        linked_windows: Vec::new(),
     };
     ws_config.save()?;
 

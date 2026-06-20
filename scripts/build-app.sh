@@ -41,6 +41,14 @@ if [[ -f "scripts/AppIcon.icns" ]]; then
     cp "scripts/AppIcon.icns" "${CONTENTS}/Resources/AppIcon.icns"
 fi
 
+# Ad-hoc sign so the bundle is a valid app for TCC (the window-linking feature
+# needs Accessibility permission, which is keyed to a signed bundle identity).
+# Without a Developer ID the signature changes on every rebuild, so macOS may
+# ask you to re-grant Accessibility after rebuilding — grant it once per build.
+echo "==> Ad-hoc signing ${APP_DIR}"
+codesign --force --deep --sign - "${APP_DIR}" 2>/dev/null \
+    || echo "    (codesign unavailable; skipping — Accessibility grants may not stick)"
+
 echo "==> Done: ${APP_DIR}"
 echo "    Run:     open ${APP_DIR}"
 echo "    Install: cp -r ${APP_DIR} /Applications/"
