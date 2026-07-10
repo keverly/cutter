@@ -108,12 +108,21 @@ enum RemoveTarget {
     Base(String),
 }
 
+/// Which half of the New-workspace dialog is active: describe-it-with-AI or the
+/// manual name/base form.
+#[derive(Clone, Copy, PartialEq)]
+enum NewWsMode {
+    Ai,
+    Manual,
+}
+
 /// A user intent collected during a UI pass, applied after rendering so the
 /// borrow of `self` from the panel/window closures has ended.
 enum PendingAction {
     CreateBase { name: String, paths: Vec<String> },
     RemoveBase(String),
     CreateWorkspace { name: String, base: String },
+    CreateWorkspaceAi { prompt: String, base: Option<String> },
     RemoveWorkspace(String),
 }
 
@@ -167,6 +176,12 @@ struct CutterApp {
     show_new_workspace: bool,
     new_ws_name: String,
     new_ws_base: Option<String>,
+    // Natural-language prompt for AI-driven creation, which mode the dialog's top
+    // switcher is on, and an optional base hint for AI mode (`None` = let Claude
+    // choose).
+    new_ws_ai: String,
+    new_ws_mode: NewWsMode,
+    new_ws_ai_base: Option<String>,
 
     // Pending "are you sure?" for a destructive action.
     confirm_remove: Option<RemoveTarget>,
@@ -228,6 +243,9 @@ impl CutterApp {
             show_new_workspace: false,
             new_ws_name: String::new(),
             new_ws_base: None,
+            new_ws_ai: String::new(),
+            new_ws_mode: NewWsMode::Ai,
+            new_ws_ai_base: None,
             confirm_remove: None,
             show_link_windows: false,
             link_for: None,
@@ -502,6 +520,14 @@ impl CutterApp {
                     commands::create::run(Some(&name), Some(&base), false, ClaudeMode::None)
                         .map_err(|e| e.to_string())?;
                     Ok(format!("Workspace '{display}' created"))
+                });
+            }
+            PendingAction::CreateWorkspaceAi { prompt, base } => {
+                let label = "Creating workspace with AI…".to_string();
+                self.start_job(ctx, label, move || {
+                    let name = commands::ai::run(&prompt, base.as_deref())
+                        .map_err(|e| e.to_string())?;
+                    Ok(format!("Workspace '{name}' created"))
                 });
             }
             PendingAction::RemoveWorkspace(name) => {
@@ -887,8 +913,12 @@ impl CutterApp {
 
     fn open_new_workspace(&mut self) {
         self.show_new_workspace = true;
+        let first_base = self.bases.keys().next().cloned();
         if self.new_ws_base.is_none() {
-            self.new_ws_base = self.bases.keys().next().cloned();
+            self.new_ws_base = first_base.clone();
+        }
+        if self.new_ws_ai_base.is_none() {
+            self.new_ws_ai_base = first_base;
         }
     }
 
@@ -1412,63 +1442,145 @@ impl CutterApp {
             .default_width(360.0)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-                ui.label(egui::RichText::new("Name").strong());
-                ui.text_edit_singleline(&mut self.new_ws_name);
-                if !self.new_ws_name.is_empty() && !name_ok {
-                    ui.colored_label(egui::Color32::RED, "Name cannot contain whitespace.");
-                }
+                // Mode switcher at the top: AI vs. manual.
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.new_ws_mode, NewWsMode::Ai, "🤖 AI");
+                    ui.selectable_value(&mut self.new_ws_mode, NewWsMode::Manual, "Manual");
+                });
+                ui.separator();
+                ui.add_space(6.0);
 
-                ui.add_space(8.0);
-                ui.label(egui::RichText::new("Base").strong());
-                if self.bases.is_empty() {
-                    ui.colored_label(
-                        egui::Color32::RED,
-                        "No bases configured. Create a base first (Settings ▸ New base).",
-                    );
-                } else {
-                    let current = self
-                        .new_ws_base
-                        .clone()
-                        .unwrap_or_else(|| "Select a base".to_string());
-                    let names: Vec<String> = self.bases.keys().cloned().collect();
-                    egui::ComboBox::from_id_salt("new_ws_base")
-                        .selected_text(current)
-                        .width(260.0)
-                        .show_ui(ui, |ui| {
-                            for n in names {
-                                let selected = self.new_ws_base.as_deref() == Some(n.as_str());
-                                if ui.selectable_label(selected, &n).clicked() {
-                                    self.new_ws_base = Some(n);
-                                }
+                match self.new_ws_mode {
+                    NewWsMode::Ai => {
+                        ui.label(
+                            egui::RichText::new(
+                                "Describe the workspace; a headless Claude session names it, \
+                                 picks a base, and creates it.",
+                            )
+                            .weak(),
+                        );
+                        ui.add_space(4.0);
+                        ui.add(
+                            egui::TextEdit::multiline(&mut self.new_ws_ai)
+                                .hint_text("e.g. fix the SSO redirect bug in ENG-1234")
+                                .desired_rows(3)
+                                .desired_width(f32::INFINITY),
+                        );
+
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new("Base").strong());
+                        if self.bases.is_empty() {
+                            ui.colored_label(
+                                egui::Color32::RED,
+                                "No bases configured. Create a base first (Settings ▸ New base).",
+                            );
+                        } else {
+                            let current = self
+                                .new_ws_ai_base
+                                .clone()
+                                .unwrap_or_else(|| "Select a base".to_string());
+                            let names: Vec<String> = self.bases.keys().cloned().collect();
+                            egui::ComboBox::from_id_salt("new_ws_ai_base")
+                                .selected_text(current)
+                                .width(260.0)
+                                .show_ui(ui, |ui| {
+                                    for n in names {
+                                        let selected =
+                                            self.new_ws_ai_base.as_deref() == Some(n.as_str());
+                                        if ui.selectable_label(selected, &n).clicked() {
+                                            self.new_ws_ai_base = Some(n);
+                                        }
+                                    }
+                                });
+                        }
+
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            let ai_ok = !self.new_ws_ai.trim().is_empty()
+                                && self.new_ws_ai_base.is_some()
+                                && self.job.is_none();
+                            if ui
+                                .add_enabled(ai_ok, egui::Button::new("🤖 Create with AI"))
+                                .clicked()
+                            {
+                                *action = Some(PendingAction::CreateWorkspaceAi {
+                                    prompt: self.new_ws_ai.trim().to_string(),
+                                    base: self.new_ws_ai_base.clone(),
+                                });
+                                close = true;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                close = true;
                             }
                         });
-                }
+                    }
+                    NewWsMode::Manual => {
+                        ui.label(egui::RichText::new("Name").strong());
+                        ui.text_edit_singleline(&mut self.new_ws_name);
+                        if !self.new_ws_name.is_empty() && !name_ok {
+                            ui.colored_label(
+                                egui::Color32::RED,
+                                "Name cannot contain whitespace.",
+                            );
+                        }
 
-                ui.add_space(8.0);
-                ui.separator();
-                ui.horizontal(|ui| {
-                    let can_create =
-                        name_ok && self.new_ws_base.is_some() && self.job.is_none();
-                    if ui
-                        .add_enabled(can_create, egui::Button::new("Create"))
-                        .clicked()
-                    {
-                        *action = Some(PendingAction::CreateWorkspace {
-                            name: name.clone(),
-                            base: self.new_ws_base.clone().unwrap(),
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new("Base").strong());
+                        if self.bases.is_empty() {
+                            ui.colored_label(
+                                egui::Color32::RED,
+                                "No bases configured. Create a base first (Settings ▸ New base).",
+                            );
+                        } else {
+                            let current = self
+                                .new_ws_base
+                                .clone()
+                                .unwrap_or_else(|| "Select a base".to_string());
+                            let names: Vec<String> = self.bases.keys().cloned().collect();
+                            egui::ComboBox::from_id_salt("new_ws_base")
+                                .selected_text(current)
+                                .width(260.0)
+                                .show_ui(ui, |ui| {
+                                    for n in names {
+                                        let selected =
+                                            self.new_ws_base.as_deref() == Some(n.as_str());
+                                        if ui.selectable_label(selected, &n).clicked() {
+                                            self.new_ws_base = Some(n);
+                                        }
+                                    }
+                                });
+                        }
+
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            let can_create =
+                                name_ok && self.new_ws_base.is_some() && self.job.is_none();
+                            if ui
+                                .add_enabled(can_create, egui::Button::new("Create"))
+                                .clicked()
+                            {
+                                *action = Some(PendingAction::CreateWorkspace {
+                                    name: name.clone(),
+                                    base: self.new_ws_base.clone().unwrap(),
+                                });
+                                close = true;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                close = true;
+                            }
                         });
-                        close = true;
                     }
-                    if ui.button("Cancel").clicked() {
-                        close = true;
-                    }
-                });
+                }
             });
 
         if close {
             self.show_new_workspace = false;
             self.new_ws_name.clear();
             self.new_ws_base = None;
+            self.new_ws_ai.clear();
+            self.new_ws_ai_base = None;
         }
     }
 

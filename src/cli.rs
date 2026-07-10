@@ -32,6 +32,11 @@ pub enum Command {
         #[arg(long)]
         base: Option<String>,
 
+        /// Describe the workspace in natural language; a headless Claude session
+        /// researches it, names it, picks a base, and runs `cutter create` for you.
+        #[arg(long, value_name = "PROMPT", conflicts_with_all = ["name", "print", "open_claude", "open_claude_dangerous"])]
+        ai: Option<String>,
+
         /// Print workspace path after creation
         #[arg(long, group = "open_mode")]
         print: bool,

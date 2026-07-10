@@ -18,16 +18,20 @@ fn main() {
             print,
             open_claude,
             open_claude_dangerous,
-        } => {
-            let claude_mode = if open_claude_dangerous {
-                ClaudeMode::DangerouslySkipPermissions
-            } else if open_claude {
-                ClaudeMode::Normal
-            } else {
-                ClaudeMode::None
-            };
-            commands::create::run(name.as_deref(), base.as_deref(), print, claude_mode)
-        }
+            ai,
+        } => match ai {
+            Some(prompt) => commands::ai::run(&prompt, base.as_deref()).map(|_| ()),
+            None => {
+                let claude_mode = if open_claude_dangerous {
+                    ClaudeMode::DangerouslySkipPermissions
+                } else if open_claude {
+                    ClaudeMode::Normal
+                } else {
+                    ClaudeMode::None
+                };
+                commands::create::run(name.as_deref(), base.as_deref(), print, claude_mode)
+            }
+        },
         Command::List => commands::list::run(),
         Command::Status { name } => {
             let name = match name {

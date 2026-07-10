@@ -50,8 +50,9 @@ The window has two tabs:
 - **Workspaces** — every active workspace; click one to open a terminal rooted
   at it (see [Terminal per workspace](#terminal-per-workspace)), or switch to
   **Details** for its base, branch, path, and per-repo worktrees. Use **➕ New**
-  to create a workspace from a base, and **🗑 Remove** (in Details) to tear one
-  down.
+  to create a workspace — either by describing it and letting Claude set it up
+  (see [AI-driven creation](#ai-driven-creation)) or by filling in a name and
+  base — and **🗑 Remove** (in Details) to tear one down.
 - **Settings** — the workspace root, default branch-from, and each base with
   its repos, `branch_from`, and `copy_files`. Use **➕ New base** to define one
   (browse for repo folders or type paths), **Edit** to add/remove its repos and
@@ -149,10 +150,49 @@ cutter remove my-feature
 
 - `--print` — print workspace path to stdout (for `cd $(cutter create ... --print)`)
 - `--open-claude` — launch `claude` in the workspace directory after creation
+- `--ai "<prompt>"` — describe the workspace in natural language and let a
+  headless Claude session name it, pick a base, and create it (see
+  [AI-driven creation](#ai-driven-creation)). Conflicts with a positional name
+  and with `--print`/`--open-claude`.
 
 ### Remove flags
 
 - `--keep-files` — remove worktrees from git but keep files on disk
+
+## AI-driven creation
+
+Instead of naming the workspace and choosing a base yourself, you can describe
+what you're doing and let Claude set it up:
+
+```sh
+cutter create --ai "fix the SSO login redirect bug tracked in ENG-4471"
+```
+
+Cutter wraps your prompt in fixed instructions, injects the list of your
+configured bases, and runs a **headless Claude Code session** (`claude -p`).
+Claude does any research the request implies, chooses a short kebab-case name
+(prefixing a referenced ticket id, e.g. `eng-4471-sso-login-redirect`), picks
+the base that best fits, and runs `cutter create <name> --base <base>` itself.
+Its progress streams to your terminal, and cutter reports the workspace it
+created.
+
+Pass `--base <base>` alongside `--ai` to pin the base yourself; Claude then only
+names it. Without it, Claude chooses from your configured bases.
+
+- **No API key** — the session rides your Claude subscription. (If
+  `ANTHROPIC_API_KEY` is set it would override the subscription, so cutter
+  removes it from the session's environment.)
+- **Scoped, not autonomous** — the session may use read-only tools (Read, Grep,
+  Glob, WebFetch, WebSearch) plus `cutter` and `git`; it can't run arbitrary
+  shell commands. It's instructed not to commit, push, or remove anything.
+- **Requirements** — [Claude Code](https://docs.claude.com/en/docs/claude-code)
+  must be installed and on your `PATH`, and you need at least one base
+  configured. Set `CUTTER_CLAUDE_BIN` to point at a specific `claude` binary if
+  it isn't discoverable.
+
+In the GUI, the **➕ New** dialog has a **🤖 AI** / **Manual** switcher at the
+top: **AI** shows a prompt box, a base picker, and a **🤖 Create with AI**
+button, while **Manual** shows the name and base fields.
 
 ## Branch From
 
