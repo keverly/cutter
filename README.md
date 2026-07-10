@@ -185,16 +185,19 @@ path = "~/repos/frontend"
 branch_from = "origin/main"  # this repo overrides the base and uses main
 ```
 
-## `.claude` merging
+## `.claude` assembly
 
-When creating a workspace, cutter automatically merges the `.claude` directories from each repo into a single `.claude` directory at the workspace root. This gives Claude unified context across all repos when launched from the workspace.
+When creating a workspace, cutter assembles a `.claude` directory at the workspace root from each repo's `.claude`, so Claude has unified context across all repos when launched from the workspace.
 
-- **`CLAUDE.md`** — concatenated with headers indicating which repo each section came from
-- **`settings.local.json`** — `permissions.allow` and `permissions.deny` arrays are merged and deduplicated
-- **Subdirectories** (e.g. `skills/`) — recursively copied, preserving structure
-- **Other files** — copied directly; if multiple repos share the same filename, each copy is prefixed with its repo name
+- **`CLAUDE.md`** — **not** merged. Instead cutter generates a `.claude/CLAUDE.md` that tells Claude to read each project's own `CLAUDE.md` (referencing `<repo>/CLAUDE.md`, or `<repo>/.claude/CLAUDE.md` if that's where it lives). Each project's instructions stay authoritative and in place.
+- **`skills/`** and **`agents/`** — namespaced per project: each repo's skills/agents are copied under a project subfolder, so the workspace has `.claude/skills/<repo>/…` and `.claude/agents/<repo>/…` and they never collide.
+- **`settings.local.json`** — `permissions.allow` and `permissions.deny` arrays are merged and deduplicated.
+- **`mcp.json`** — `mcpServers` are merged; on a name clash between repos, the later one is renamed `<repo>/<server>`.
+- **Other files** — copied by relative path; if multiple repos share the same path, each copy is prefixed with its repo name.
 
-If no repos contain a `.claude` directory, the step is skipped.
+The generated `.claude/CLAUDE.md` is always written (even if no repo has a `.claude` directory).
+
+> **Note:** the merge reads each repo's **checked-out worktree**, which only contains git-*tracked* files. A gitignored `.claude` file (commonly `settings.local.json`) won't be present in the worktree and so won't be merged.
 
 ### Per-base `.claude` directory
 
@@ -202,7 +205,7 @@ You can customize the merged `.claude` directory on a per-base level by placing 
 
 Merge behavior:
 
-- **`CLAUDE.md`** — base content is appended after the repo-merged content (with a `# CLAUDE.md (from base)` header)
+- **`CLAUDE.md`** — base content is appended after the generated workspace `CLAUDE.md` (with a `# CLAUDE.md (from base)` header)
 - **`settings.local.json`** — base allow/deny entries are merged into the repo-merged ones
 - **`mcp.json`** — base MCP servers are merged in; base servers override same-named repo servers
 - **Other files** — base files overwrite repo-merged files at the same relative path
@@ -239,10 +242,16 @@ If the base `.claude` directory doesn't exist, the step is skipped.
 
 ~/cutter/
 └── my-feature/              # Workspace root
-    ├── .claude/             # Merged from all repos
-    │   ├── CLAUDE.md
+    ├── CLAUDE.md            # (in each worktree) each project's own instructions
+    ├── .claude/             # Assembled from all repos
+    │   ├── CLAUDE.md        # Generated: points at each project's CLAUDE.md
     │   ├── settings.local.json
-    │   └── skills/
+    │   ├── skills/
+    │   │   ├── frontend/    # Namespaced per project
+    │   │   └── backend/
+    │   └── agents/
+    │       ├── frontend/
+    │       └── backend/
     ├── frontend/            # Worktree (branch = my-feature)
     ├── backend/             # Worktree (branch = my-feature)
     └── shared-libs/         # Worktree (branch = my-feature)

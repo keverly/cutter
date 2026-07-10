@@ -173,7 +173,9 @@ pub fn run(name: Option<&str>, base_name: Option<&str>, print: bool, claude_mode
         copy_base_files(&base.copy_files, &base.repos, &workspace_dir, quiet)?;
     }
 
-    // Merge .claude directories from each repo into workspace root
+    // Assemble the workspace .claude: a generated CLAUDE.md that points at each
+    // project's own CLAUDE.md, per-project namespaced skills/agents, and merged
+    // settings/mcp.
     merge_claude_dirs(&workspace_dir, &created_worktrees, quiet)?;
 
     // Overlay base-level .claude directory on top of merged result
@@ -257,38 +259,68 @@ fn copy_base_files(
     Ok(())
 }
 
-/// Merge .claude directories from each repo worktree into the workspace root.
+/// Assemble the workspace's `.claude` directory from each repo's `.claude`.
 ///
-/// - CLAUDE.md files are concatenated with repo name headers
-/// - settings.local.json files have their allow/deny lists merged
-/// - Subdirectories (e.g. skills/) are recursively copied and merged
-/// - Other files are copied; conflicts are resolved by appending repo name
+/// - CLAUDE.md is *not* merged. Instead a workspace `.claude/CLAUDE.md` is
+///   generated that points Claude at each project's own CLAUDE.md, keeping each
+///   project's instructions authoritative and in place.
+/// - `skills/` and `agents/` are namespaced per project:
+///   `.claude/skills/<project>/…` and `.claude/agents/<project>/…`.
+/// - settings.local.json (allow/deny) and mcp.json (servers) are merged.
+/// - Any other files are copied by relative path; conflicts across repos are
+///   resolved by prefixing the filename with the repo name.
 fn merge_claude_dirs(workspace_dir: &Path, worktrees: &[(PathBuf, PathBuf)], quiet: bool) -> Result<()> {
-    let mut claude_md_parts: Vec<(String, String)> = Vec::new();
     let mut merged_allow: Vec<String> = Vec::new();
     let mut merged_deny: Vec<String> = Vec::new();
     let mut merged_mcp_servers: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
     // Maps relative path (from .claude/) -> list of (repo_name, absolute_path)
     let mut other_files: HashMap<PathBuf, Vec<(String, PathBuf)>> = HashMap::new();
-    let mut found_any = false;
+    // (repo_name, relative path to its own CLAUDE.md if it has one), for the
+    // generated pointer file.
+    let mut projects: Vec<(String, Option<String>)> = Vec::new();
+
+    let ws_claude_dir = workspace_dir.join(".claude");
+    std::fs::create_dir_all(&ws_claude_dir)?;
 
     for (_source, target) in worktrees {
-        let claude_dir = target.join(".claude");
-        if !claude_dir.is_dir() {
-            continue;
-        }
-        found_any = true;
         let repo_name = target
             .file_name()
             .unwrap_or_default()
             .to_string_lossy()
             .to_string();
 
+        // Locate this project's own CLAUDE.md (repo root preferred, then
+        // .claude/) so the generated pointer can reference it.
+        let claude_md_rel = if target.join("CLAUDE.md").is_file() {
+            Some(format!("{repo_name}/CLAUDE.md"))
+        } else if target.join(".claude").join("CLAUDE.md").is_file() {
+            Some(format!("{repo_name}/.claude/CLAUDE.md"))
+        } else {
+            None
+        };
+        projects.push((repo_name.clone(), claude_md_rel));
+
+        let claude_dir = target.join(".claude");
+        if !claude_dir.is_dir() {
+            continue;
+        }
+
+        // Namespace skills/ and agents/ under a per-project subdirectory so they
+        // don't collide across repos.
+        for sub in ["skills", "agents"] {
+            let src = claude_dir.join(sub);
+            if src.is_dir() {
+                let dest = ws_claude_dir.join(sub).join(&repo_name);
+                copy_dir_recursive(&src, &dest)?;
+            }
+        }
+
+        // Merge settings.local.json / mcp.json and collect any remaining files
+        // (CLAUDE.md, skills/, and agents/ are handled above and skipped here).
         collect_claude_entries(
             &claude_dir,
             &claude_dir,
             &repo_name,
-            &mut claude_md_parts,
             &mut merged_allow,
             &mut merged_deny,
             &mut merged_mcp_servers,
@@ -296,26 +328,13 @@ fn merge_claude_dirs(workspace_dir: &Path, worktrees: &[(PathBuf, PathBuf)], qui
         )?;
     }
 
-    if !found_any {
-        return Ok(());
-    }
-
-    let ws_claude_dir = workspace_dir.join(".claude");
-    std::fs::create_dir_all(&ws_claude_dir)?;
-
-    // Write merged CLAUDE.md
-    if !claude_md_parts.is_empty() {
-        let mut merged = String::new();
-        for (repo_name, content) in &claude_md_parts {
-            if !merged.is_empty() {
-                merged.push_str("\n\n");
-            }
-            merged.push_str(&format!("# {} (from {})\n\n", "CLAUDE.md", repo_name));
-            merged.push_str(content.trim());
-        }
-        merged.push('\n');
-        std::fs::write(ws_claude_dir.join("CLAUDE.md"), &merged)?;
-    }
+    // Generated CLAUDE.md pointing at each project's own instructions.
+    let workspace_name = workspace_dir
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy();
+    let claude_md = generate_workspace_claude_md(&workspace_name, &projects);
+    std::fs::write(ws_claude_dir.join("CLAUDE.md"), claude_md)?;
 
     // Write merged settings.local.json
     if !merged_allow.is_empty() || !merged_deny.is_empty() {
@@ -374,9 +393,56 @@ fn merge_claude_dirs(workspace_dir: &Path, worktrees: &[(PathBuf, PathBuf)], qui
         }
     }
 
-    info!(quiet, "  {} Merged .claude directories", "✓".green());
+    info!(quiet, "  {} Assembled .claude directory", "✓".green());
 
     Ok(())
+}
+
+/// Recursively copy a directory tree from `src` into `dest`, creating `dest`
+/// and any parent directories. Existing files at `dest` are overwritten.
+fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
+    std::fs::create_dir_all(dest)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let path = entry.path();
+        let target = dest.join(entry.file_name());
+        if path.is_dir() {
+            copy_dir_recursive(&path, &target)?;
+        } else if path.is_file() {
+            std::fs::copy(&path, &target)?;
+        }
+    }
+    Ok(())
+}
+
+/// Build the generated workspace `CLAUDE.md`: a short pointer telling Claude to
+/// read each project's own CLAUDE.md, plus a note on where namespaced skills and
+/// agents live.
+fn generate_workspace_claude_md(
+    workspace_name: &str,
+    projects: &[(String, Option<String>)],
+) -> String {
+    let mut s = format!("# {workspace_name}\n\n");
+    s.push_str(
+        "This is a multi-project workspace created by Cutter. Each subdirectory \
+         below is a separate git worktree for one project, and each project has \
+         its own instructions. **Read each project's `CLAUDE.md` before working \
+         in that project.**\n\n",
+    );
+    s.push_str("## Projects\n\n");
+    for (name, claude_md) in projects {
+        match claude_md {
+            Some(rel) => s.push_str(&format!("- `{name}/` — read `{rel}`\n")),
+            None => s.push_str(&format!("- `{name}/` — (no CLAUDE.md)\n")),
+        }
+    }
+    s.push_str(
+        "\n## Skills and agents\n\n\
+         Skills and agents contributed by each project are namespaced by project:\n\n\
+         - `.claude/skills/<project>/…`\n\
+         - `.claude/agents/<project>/…`\n",
+    );
+    s
 }
 
 /// Overlay a base-level .claude directory on top of the already-merged workspace .claude.
@@ -512,12 +578,14 @@ fn overlay_base_claude_dir_recursive(
     Ok(())
 }
 
-/// Recursively collect entries from a .claude directory.
+/// Recursively collect settings.local.json / mcp.json / other files from a
+/// .claude directory. CLAUDE.md and the top-level `skills/` and `agents/`
+/// directories are skipped — they're handled separately by
+/// [`merge_claude_dirs`] (generated pointer and per-project namespacing).
 fn collect_claude_entries(
     base: &Path,
     dir: &Path,
     repo_name: &str,
-    claude_md_parts: &mut Vec<(String, String)>,
     merged_allow: &mut Vec<String>,
     merged_deny: &mut Vec<String>,
     merged_mcp_servers: &mut serde_json::Map<String, serde_json::Value>,
@@ -529,12 +597,18 @@ fn collect_claude_entries(
         let rel_path = path.strip_prefix(base).unwrap().to_path_buf();
 
         if path.is_dir() {
-            collect_claude_entries(base, &path, repo_name, claude_md_parts, merged_allow, merged_deny, merged_mcp_servers, other_files)?;
+            // skills/ and agents/ are namespaced per project elsewhere.
+            let rel = rel_path.to_string_lossy();
+            if rel == "skills" || rel == "agents" {
+                continue;
+            }
+            collect_claude_entries(base, &path, repo_name, merged_allow, merged_deny, merged_mcp_servers, other_files)?;
         } else if path.is_file() {
             let rel_str = rel_path.to_string_lossy();
             if rel_str == "CLAUDE.md" {
-                let content = std::fs::read_to_string(&path)?;
-                claude_md_parts.push((repo_name.to_string(), content));
+                // Not merged: the generated workspace CLAUDE.md points at each
+                // project's own CLAUDE.md instead.
+                continue;
             } else if rel_str == "settings.local.json" {
                 merge_settings_json(&path, merged_allow, merged_deny)?;
             } else if rel_str == "mcp.json" {
