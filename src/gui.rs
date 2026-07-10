@@ -9,7 +9,7 @@ use notify_debouncer_mini::{new_debouncer, DebounceEventResult, Debouncer};
 
 use crate::cli::ClaudeMode;
 use crate::commands;
-use crate::config::{config_dir, expand_tilde, Base, Config};
+use crate::config::{config_dir, expand_tilde, Base, Config, RepoRef};
 use crate::window_manager::{self, WindowInfo};
 use crate::workspace::{LinkedWindow, WorkspaceConfig};
 
@@ -118,6 +118,15 @@ struct CutterApp {
     new_base_repos: Vec<String>,
     new_base_manual_path: String,
 
+    // Edit-base form. `edit_base_name` is the (immutable) base being edited.
+    show_edit_base: bool,
+    edit_base_name: String,
+    edit_repos: Vec<RepoRef>,
+    edit_branch_from: String,
+    edit_copy_files: Vec<String>,
+    edit_new_copy_file: String,
+    edit_error: Option<String>,
+
     // New-workspace form
     show_new_workspace: bool,
     new_ws_name: String,
@@ -161,6 +170,13 @@ impl CutterApp {
             new_base_name: String::new(),
             new_base_repos: Vec::new(),
             new_base_manual_path: String::new(),
+            show_edit_base: false,
+            edit_base_name: String::new(),
+            edit_repos: Vec::new(),
+            edit_branch_from: String::new(),
+            edit_copy_files: Vec::new(),
+            edit_new_copy_file: String::new(),
+            edit_error: None,
             show_new_workspace: false,
             new_ws_name: String::new(),
             new_ws_base: None,
@@ -501,6 +517,7 @@ impl CutterApp {
         let job_active = self.job.is_some();
         let mut open_new_base = false;
         let mut want_remove_base: Option<String> = None;
+        let mut want_edit_base: Option<String> = None;
 
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
@@ -567,6 +584,13 @@ impl CutterApp {
                                     {
                                         want_remove_base = Some(name.clone());
                                     }
+                                    if ui
+                                        .add_enabled(!job_active, egui::Button::new("Edit"))
+                                        .on_hover_text("Edit repos, branch-from, and copy files")
+                                        .clicked()
+                                    {
+                                        want_edit_base = Some(name.clone());
+                                    }
                                 },
                             );
                         });
@@ -608,6 +632,22 @@ impl CutterApp {
         }
         if let Some(name) = want_remove_base {
             self.confirm_remove = Some(RemoveTarget::Base(name));
+        }
+        if let Some(name) = want_edit_base {
+            self.open_edit_base(name);
+        }
+    }
+
+    /// Load a base into the edit form and open the modal.
+    fn open_edit_base(&mut self, base_name: String) {
+        if let Some(base) = self.bases.get(&base_name).cloned() {
+            self.edit_branch_from = base.branch_from.clone().unwrap_or_default();
+            self.edit_copy_files = base.copy_files.clone();
+            self.edit_repos = base.repos.clone();
+            self.edit_base_name = base_name;
+            self.edit_new_copy_file.clear();
+            self.edit_error = None;
+            self.show_edit_base = true;
         }
     }
 
@@ -959,6 +999,168 @@ impl CutterApp {
         }
     }
 
+    /// Modal form for editing an existing base: its repos, base-level
+    /// branch-from override, and copy-files list.
+    fn edit_base_window(&mut self, ctx: &egui::Context) {
+        if !self.show_edit_base {
+            return;
+        }
+        let name = self.edit_base_name.clone();
+        let mut close = false;
+        let mut do_save = false;
+
+        egui::Window::new(format!("Edit base · {name}"))
+            .collapsible(false)
+            .resizable(true)
+            .default_width(480.0)
+            .default_height(440.0)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                if let Some(err) = &self.edit_error {
+                    ui.colored_label(egui::Color32::RED, err);
+                    ui.add_space(4.0);
+                }
+
+                // --- Repos ---
+                ui.label(egui::RichText::new("Repositories").strong());
+                let mut remove_repo: Option<usize> = None;
+                egui::ScrollArea::vertical()
+                    .id_salt("edit_repos")
+                    .max_height(150.0)
+                    .show(ui, |ui| {
+                        for (i, repo) in self.edit_repos.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                if ui.small_button("✕").on_hover_text("Remove repo").clicked() {
+                                    remove_repo = Some(i);
+                                }
+                                ui.label(egui::RichText::new(repo.name.as_str()).strong());
+                                ui.label(egui::RichText::new(repo.path.as_str()).monospace().weak());
+                            });
+                        }
+                    });
+                if let Some(i) = remove_repo {
+                    self.edit_repos.remove(i);
+                }
+                if ui.button("Add repo…").clicked() {
+                    self.edit_error = None;
+                    if let Some(paths) = rfd::FileDialog::new()
+                        .set_title("Add repositories to base")
+                        .pick_folders()
+                    {
+                        for p in paths {
+                            match commands::base::make_repo_ref(&p) {
+                                Ok(repo) => {
+                                    if !self.edit_repos.iter().any(|r| r.path == repo.path) {
+                                        self.edit_repos.push(repo);
+                                    }
+                                }
+                                Err(e) => self.edit_error = Some(e.to_string()),
+                            }
+                        }
+                    }
+                }
+
+                ui.add_space(10.0);
+                // --- Base-level branch-from ---
+                ui.label(egui::RichText::new("Branch from").strong());
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.edit_branch_from)
+                        .hint_text(format!("empty = inherit ({})", self.default_branch_from))
+                        .desired_width(320.0),
+                );
+
+                ui.add_space(10.0);
+                // --- Copy files ---
+                ui.label(egui::RichText::new("Copy files").strong());
+                ui.label(
+                    egui::RichText::new("Gitignored files copied into each worktree (e.g. .env).")
+                        .weak(),
+                );
+                let mut remove_copy: Option<usize> = None;
+                for (i, file) in self.edit_copy_files.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        if ui.small_button("✕").clicked() {
+                            remove_copy = Some(i);
+                        }
+                        ui.label(egui::RichText::new(file.as_str()).monospace());
+                    });
+                }
+                if let Some(i) = remove_copy {
+                    self.edit_copy_files.remove(i);
+                }
+                ui.horizontal(|ui| {
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.edit_new_copy_file)
+                            .hint_text(".env")
+                            .desired_width(240.0),
+                    );
+                    let submit =
+                        resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if (ui.button("Add").clicked() || submit)
+                        && !self.edit_new_copy_file.trim().is_empty()
+                    {
+                        let f = self.edit_new_copy_file.trim().to_string();
+                        if !self.edit_copy_files.contains(&f) {
+                            self.edit_copy_files.push(f);
+                        }
+                        self.edit_new_copy_file.clear();
+                    }
+                });
+
+                ui.add_space(8.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    let can_save = !self.edit_repos.is_empty() && self.job.is_none();
+                    if ui
+                        .add_enabled(can_save, egui::Button::new("Save"))
+                        .on_hover_text("A base needs at least one repo")
+                        .clicked()
+                    {
+                        do_save = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        close = true;
+                    }
+                });
+            });
+
+        if do_save {
+            let branch_from = {
+                let t = self.edit_branch_from.trim();
+                if t.is_empty() {
+                    None
+                } else {
+                    Some(t.to_string())
+                }
+            };
+            let base = Base {
+                repos: self.edit_repos.clone(),
+                branch_from,
+                copy_files: self.edit_copy_files.clone(),
+            };
+            match commands::base::update(&name, base) {
+                Ok(()) => {
+                    self.status = Some(StatusMsg {
+                        ok: true,
+                        text: format!("Base '{name}' updated"),
+                    });
+                    self.reload();
+                    close = true;
+                }
+                Err(e) => self.edit_error = Some(e.to_string()),
+            }
+        }
+
+        if close {
+            self.show_edit_base = false;
+            self.edit_base_name.clear();
+            self.edit_repos.clear();
+            self.edit_copy_files.clear();
+            self.edit_new_copy_file.clear();
+            self.edit_error = None;
+        }
+    }
+
     /// Modal form for creating a new workspace from an existing base.
     fn new_workspace_window(&mut self, ctx: &egui::Context, action: &mut Option<PendingAction>) {
         if !self.show_new_workspace {
@@ -1182,6 +1384,7 @@ impl eframe::App for CutterApp {
         // borrows of `self` have ended.
         let mut action: Option<PendingAction> = None;
         self.new_base_window(ctx, &mut action);
+        self.edit_base_window(ctx);
         self.new_workspace_window(ctx, &mut action);
         self.confirm_window(ctx, &mut action);
         self.link_windows_window(ctx);

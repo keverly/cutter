@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use colored::Colorize;
 use tabled::{Table, Tabled};
 
@@ -13,6 +15,27 @@ struct BaseRow {
     repos: String,
 }
 
+/// Build a [`RepoRef`] from a local path, validating that it's a git repo and
+/// deriving the repo name from the directory. Shared by `add` and GUI editing.
+pub fn make_repo_ref(path: &Path) -> Result<RepoRef> {
+    let canonical = canonicalize_repo_path(path)?;
+
+    if !git::is_git_repo(&canonical) {
+        return Err(Error::NotAGitRepo(canonical));
+    }
+
+    let repo_name = canonical
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    Ok(RepoRef {
+        name: repo_name,
+        path: canonical.to_string_lossy().to_string(),
+        branch_from: None,
+    })
+}
+
 pub fn add(name: &str, paths: &[std::path::PathBuf]) -> Result<()> {
     let mut config = Config::load()?;
 
@@ -22,22 +45,7 @@ pub fn add(name: &str, paths: &[std::path::PathBuf]) -> Result<()> {
 
     let mut repos = Vec::new();
     for path in paths {
-        let canonical = canonicalize_repo_path(path)?;
-
-        if !git::is_git_repo(&canonical) {
-            return Err(Error::NotAGitRepo(canonical));
-        }
-
-        let repo_name = canonical
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "unknown".to_string());
-
-        repos.push(RepoRef {
-            name: repo_name,
-            path: canonical.to_string_lossy().to_string(),
-            branch_from: None,
-        });
+        repos.push(make_repo_ref(path)?);
     }
 
     config
@@ -46,6 +54,19 @@ pub fn add(name: &str, paths: &[std::path::PathBuf]) -> Result<()> {
     config.save()?;
 
     println!("{} Base '{}' added", "✓".green(), name.bold());
+    Ok(())
+}
+
+/// Replace an existing base's definition with `base`. Errors if it doesn't exist.
+pub fn update(name: &str, base: Base) -> Result<()> {
+    let mut config = Config::load()?;
+
+    if !config.bases.contains_key(name) {
+        return Err(Error::BaseNotFound(name.to_string()));
+    }
+
+    config.bases.insert(name.to_string(), base);
+    config.save()?;
     Ok(())
 }
 

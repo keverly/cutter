@@ -52,7 +52,8 @@ The window has two tabs:
   workspace from a base, and **🗑 Remove** to tear one down.
 - **Settings** — the workspace root, default branch-from, and each base with
   its repos, `branch_from`, and `copy_files`. Use **➕ New base** to define one
-  (browse for repo folders or type paths), and **Remove** to delete a base
+  (browse for repo folders or type paths), **Edit** to add/remove its repos and
+  change its branch-from and copy files, and **Remove** to delete a base
   definition.
 
 Creating and removing run the same logic as the CLI commands, on a background
