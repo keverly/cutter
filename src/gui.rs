@@ -1,9 +1,10 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
 use eframe::egui;
+use egui_term::{PtyEvent, TerminalBackend, TerminalView};
 use notify_debouncer_mini::notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_mini::{new_debouncer, DebounceEventResult, Debouncer};
 
@@ -15,6 +16,16 @@ use crate::workspace::{LinkedWindow, WorkspaceConfig};
 
 /// Launch the standalone Cutter GUI window.
 pub fn run() -> eframe::Result<()> {
+    // Embedded terminals inherit this process's environment. Launched from
+    // Finder, Cutter has no TERM, so shell programs (e.g. Claude Code) assume a
+    // color-less terminal and emit no color. Advertise the emulator's real
+    // capabilities — it's an xterm-class, truecolor VT (alacritty's engine, and
+    // the widget renders per-cell ANSI colors). alacritty/egui_term don't set
+    // these themselves. `xterm-256color` is chosen over `alacritty` because its
+    // terminfo is present on virtually every system.
+    std::env::set_var("TERM", "xterm-256color");
+    std::env::set_var("COLORTERM", "truecolor");
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Cutter")
@@ -63,6 +74,31 @@ fn spawn_watcher(ctx: egui::Context) -> Option<(Debouncer<RecommendedWatcher>, R
 enum Tab {
     Workspaces,
     Settings,
+}
+
+/// Which pane the selected workspace shows: an embedded terminal (the default,
+/// so clicking a workspace lands on a live shell) or its details (repos, linked
+/// windows, remove).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceView {
+    Terminal,
+    Details,
+}
+
+/// One terminal tab within a workspace: a live PTY-backed terminal, its stable
+/// global id (used to route PTY events), and its current title (updated by the
+/// shell via OSC title sequences).
+struct TermTab {
+    id: u64,
+    backend: TerminalBackend,
+    title: String,
+}
+
+/// The terminals belonging to a single workspace: the open tabs and the index
+/// of the active one.
+struct WorkspaceTerminals {
+    tabs: Vec<TermTab>,
+    active: usize,
 }
 
 /// The target of a pending "are you sure?" confirmation.
@@ -153,10 +189,22 @@ struct CutterApp {
     // watching; `fs_rx` receives a tick whenever the config dir changes.
     _debouncer: Option<Debouncer<RecommendedWatcher>>,
     fs_rx: Option<Receiver<()>>,
+
+    // Embedded terminals. `ws_view` selects the terminal or details pane for the
+    // selected workspace. `terminals` holds the live terminals per workspace
+    // (keyed by name), created lazily on first view. Every backend reports PTY
+    // events as `(tab id, event)` on the shared channel; ids are globally unique
+    // (handed out by `next_term_id`) so each event routes to exactly one tab.
+    ws_view: WorkspaceView,
+    terminals: HashMap<String, WorkspaceTerminals>,
+    term_tx: Sender<(u64, PtyEvent)>,
+    term_rx: Receiver<(u64, PtyEvent)>,
+    next_term_id: u64,
 }
 
 impl CutterApp {
     fn new(ctx: &egui::Context) -> Self {
+        let (term_tx, term_rx) = std::sync::mpsc::channel();
         let mut app = Self {
             tab: Tab::Workspaces,
             workspaces: Vec::new(),
@@ -191,6 +239,11 @@ impl CutterApp {
             status: None,
             _debouncer: None,
             fs_rx: None,
+            ws_view: WorkspaceView::Terminal,
+            terminals: HashMap::new(),
+            term_tx,
+            term_rx,
+            next_term_id: 0,
         };
         app.reload();
         if let Some((debouncer, rx)) = spawn_watcher(ctx.clone()) {
@@ -236,6 +289,164 @@ impl CutterApp {
     fn selected_workspace(&self) -> Option<&WorkspaceConfig> {
         let name = self.selected.as_ref()?;
         self.workspaces.iter().find(|w| &w.workspace.name == name)
+    }
+
+    /// Spawn one PTY-backed terminal rooted at `path`, taking the next global
+    /// id. Returns `None` if the backend fails to start (e.g. bad shell), which
+    /// the caller surfaces as no new tab.
+    fn spawn_terminal(
+        next_id: &mut u64,
+        ctx: &egui::Context,
+        tx: &Sender<(u64, PtyEvent)>,
+        path: &str,
+    ) -> Option<TermTab> {
+        let id = *next_id;
+        *next_id += 1;
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+        // Default tab label is the shell name (e.g. "zsh"); the shell usually
+        // replaces it via an OSC title sequence once it starts.
+        let title = std::path::Path::new(&shell)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "shell".to_string());
+        let settings = egui_term::BackendSettings {
+            shell,
+            working_directory: Some(PathBuf::from(path)),
+            ..Default::default()
+        };
+        match TerminalBackend::new(id, ctx.clone(), tx.clone(), settings) {
+            Ok(backend) => Some(TermTab { id, backend, title }),
+            Err(_) => None,
+        }
+    }
+
+    /// Route a terminal PTY event to its tab by global id: a finished shell
+    /// closes its tab; a title sequence renames it.
+    fn on_term_event(&mut self, id: u64, event: PtyEvent) {
+        match event {
+            PtyEvent::Exit => self.remove_term_by_id(id),
+            PtyEvent::Title(title) => {
+                for term in self.terminals.values_mut() {
+                    if let Some(t) = term.tabs.iter_mut().find(|t| t.id == id) {
+                        t.title = title;
+                        return;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Remove the terminal tab with `id` from whichever workspace owns it,
+    /// keeping that workspace's active index in range.
+    fn remove_term_by_id(&mut self, id: u64) {
+        for term in self.terminals.values_mut() {
+            if let Some(pos) = term.tabs.iter().position(|t| t.id == id) {
+                term.tabs.remove(pos);
+                if !term.tabs.is_empty() && term.active >= term.tabs.len() {
+                    term.active = term.tabs.len() - 1;
+                }
+                return;
+            }
+        }
+    }
+
+    /// Render the terminal pane for `ws_name`: a tab strip (＋ to add, ✕ to
+    /// close) above the active terminal, which fills the rest of the pane. The
+    /// first tab is created lazily so clicking a workspace lands on a shell.
+    fn terminal_pane(&mut self, ui: &mut egui::Ui, ws_name: &str) {
+        use std::collections::hash_map::Entry;
+        let ctx = ui.ctx().clone();
+
+        // The shell is rooted at the workspace directory.
+        let Some(path) = self
+            .workspaces
+            .iter()
+            .find(|w| w.workspace.name == ws_name)
+            .map(|w| w.workspace.path.clone())
+        else {
+            return;
+        };
+
+        // First time this workspace's terminal is shown, open one tab. Closing
+        // every tab afterwards leaves it empty (＋ reopens one) rather than
+        // respawning against the user's intent.
+        if let Entry::Vacant(v) = self.terminals.entry(ws_name.to_string()) {
+            match Self::spawn_terminal(&mut self.next_term_id, &ctx, &self.term_tx, &path) {
+                Some(tab) => {
+                    v.insert(WorkspaceTerminals {
+                        tabs: vec![tab],
+                        active: 0,
+                    });
+                }
+                None => {
+                    ui.colored_label(egui::Color32::RED, "Failed to start a terminal.");
+                    return;
+                }
+            }
+        }
+
+        let term = self.terminals.get_mut(ws_name).expect("just inserted");
+
+        // --- tab strip ---
+        let mut want_activate: Option<usize> = None;
+        let mut want_close: Option<usize> = None;
+        let mut want_add = false;
+        ui.horizontal(|ui| {
+            for i in 0..term.tabs.len() {
+                let selected = i == term.active;
+                let title = term.tabs[i].title.clone();
+                if ui.selectable_label(selected, title).clicked() {
+                    want_activate = Some(i);
+                }
+                // U+2716 (✖) and U+2795 (➕) below are glyphs egui's bundled
+                // fonts actually ship; plain "x"/"＋" (U+FF0B) render as tofu.
+                if ui.small_button("✖").on_hover_text("Close terminal").clicked() {
+                    want_close = Some(i);
+                }
+                ui.separator();
+            }
+            if ui.button("➕").on_hover_text("New terminal").clicked() {
+                want_add = true;
+            }
+        });
+        if let Some(i) = want_activate {
+            term.active = i;
+        }
+        ui.separator();
+
+        // --- active terminal fills the rest of the pane ---
+        if term.tabs.is_empty() {
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("No terminals open. Use ＋ to start one.").weak());
+        } else {
+            if term.active >= term.tabs.len() {
+                term.active = term.tabs.len() - 1;
+            }
+            let backend = &mut term.tabs[term.active].backend;
+            let terminal = TerminalView::new(ui, backend)
+                .set_focus(true)
+                .set_size(ui.available_size());
+            ui.add(terminal);
+        }
+
+        // --- apply tab intents after rendering ---
+        if let Some(i) = want_close {
+            if i < term.tabs.len() {
+                term.tabs.remove(i);
+                if !term.tabs.is_empty() && term.active >= term.tabs.len() {
+                    term.active = term.tabs.len() - 1;
+                }
+            }
+        }
+        if want_add {
+            if let Some(tab) =
+                Self::spawn_terminal(&mut self.next_term_id, &ctx, &self.term_tx, &path)
+            {
+                term.tabs.push(tab);
+                term.active = term.tabs.len() - 1;
+            }
+        }
     }
 
     /// Spawn `op` on a worker thread, wake the UI when it finishes, and surface
@@ -304,7 +515,7 @@ impl CutterApp {
         }
     }
 
-    fn workspaces_ui(&mut self, ctx: &egui::Context) {
+    fn workspaces_ui(&mut self, ui: &mut egui::Ui) {
         let job_active = self.job.is_some();
         let mut want_remove_ws: Option<String> = None;
         // A list item was clicked this frame → raise that workspace's windows.
@@ -313,10 +524,10 @@ impl CutterApp {
         let mut open_link = false;
         let mut unlink_idx: Option<usize> = None;
 
-        egui::SidePanel::left("workspace_list")
+        egui::Panel::left("workspace_list")
             .resizable(true)
-            .default_width(220.0)
-            .show(ctx, |ui| {
+            .default_size(220.0)
+            .show_inside(ui, |ui| {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     ui.label(
@@ -372,19 +583,41 @@ impl CutterApp {
                 });
             });
 
-        egui::CentralPanel::default().show(ctx, |ui| match self.selected_workspace() {
-            Some(ws) => Self::workspace_details(
-                ui,
-                ws,
-                job_active,
-                &mut want_remove_ws,
-                &mut open_link,
-                &mut unlink_idx,
-            ),
-            None => {
+        egui::CentralPanel::default().show_inside(ui, |ui| {
+            let Some(name) = self.selected.clone() else {
                 ui.centered_and_justified(|ui| {
                     ui.label(egui::RichText::new("Select a workspace").weak());
                 });
+                return;
+            };
+
+            // Header: workspace name + Terminal/Details view toggle.
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.heading(&name);
+                ui.separator();
+                ui.selectable_value(&mut self.ws_view, WorkspaceView::Terminal, "Terminal");
+                ui.selectable_value(&mut self.ws_view, WorkspaceView::Details, "Details");
+            });
+            ui.separator();
+
+            match self.ws_view {
+                WorkspaceView::Terminal => self.terminal_pane(ui, &name),
+                WorkspaceView::Details => match self.selected_workspace() {
+                    Some(ws) => Self::workspace_details(
+                        ui,
+                        ws,
+                        job_active,
+                        &mut want_remove_ws,
+                        &mut open_link,
+                        &mut unlink_idx,
+                    ),
+                    None => {
+                        ui.centered_and_justified(|ui| {
+                            ui.label(egui::RichText::new("Select a workspace").weak());
+                        });
+                    }
+                },
             }
         });
 
@@ -416,8 +649,9 @@ impl CutterApp {
     ) {
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.add_space(6.0);
+            // The workspace name is shown in the pane header; here we just offer
+            // the (contextual) Remove action, right-aligned.
             ui.horizontal(|ui| {
-                ui.heading(&ws.workspace.name);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
                         .add_enabled(!job_active, egui::Button::new("🗑 Remove"))
@@ -513,13 +747,13 @@ impl CutterApp {
         });
     }
 
-    fn settings_ui(&mut self, ctx: &egui::Context) {
+    fn settings_ui(&mut self, ui: &mut egui::Ui) {
         let job_active = self.job.is_some();
         let mut open_new_base = false;
         let mut want_remove_base: Option<String> = None;
         let mut want_edit_base: Option<String> = None;
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show_inside(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.add_space(6.0);
                 ui.heading("Settings");
@@ -1296,8 +1530,21 @@ impl CutterApp {
 }
 
 impl eframe::App for CutterApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
         let mut do_refresh = false;
+
+        // Closing the window: drop all terminals so their shells terminate.
+        if ctx.input(|i| i.viewport().close_requested()) {
+            self.terminals.clear();
+        }
+
+        // Route any terminal PTY events (title changes, shell exits) collected
+        // since the last frame. Backends request a repaint on new output, so
+        // this runs promptly without polling.
+        while let Ok((id, event)) = self.term_rx.try_recv() {
+            self.on_term_event(id, event);
+        }
 
         // A finished background job: surface its outcome and re-read from disk.
         if let Some(rx) = &self.job_rx {
@@ -1319,7 +1566,7 @@ impl eframe::App for CutterApp {
             }
         }
 
-        egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
+        egui::Panel::top("tabs").show_inside(ui, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.heading("Cutter");
@@ -1338,7 +1585,7 @@ impl eframe::App for CutterApp {
         // Status bar: spinner while a job runs, else the last result.
         let mut dismiss = false;
         if self.job.is_some() || self.status.is_some() {
-            egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
+            egui::Panel::bottom("status_bar").show_inside(ui, |ui| {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     if let Some(job) = &self.job {
@@ -1376,20 +1623,20 @@ impl eframe::App for CutterApp {
         }
 
         match self.tab {
-            Tab::Workspaces => self.workspaces_ui(ctx),
-            Tab::Settings => self.settings_ui(ctx),
+            Tab::Workspaces => self.workspaces_ui(ui),
+            Tab::Settings => self.settings_ui(ui),
         }
 
         // Floating forms collect intent into `action`, applied once their
         // borrows of `self` have ended.
         let mut action: Option<PendingAction> = None;
-        self.new_base_window(ctx, &mut action);
-        self.edit_base_window(ctx);
-        self.new_workspace_window(ctx, &mut action);
-        self.confirm_window(ctx, &mut action);
-        self.link_windows_window(ctx);
+        self.new_base_window(&ctx, &mut action);
+        self.edit_base_window(&ctx);
+        self.new_workspace_window(&ctx, &mut action);
+        self.confirm_window(&ctx, &mut action);
+        self.link_windows_window(&ctx);
         if let Some(action) = action {
-            self.dispatch(ctx, action);
+            self.dispatch(&ctx, action);
         }
     }
 }

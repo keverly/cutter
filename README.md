@@ -47,9 +47,11 @@ cp -r dist/Cutter.app /Applications/
 
 The window has two tabs:
 
-- **Workspaces** — every active workspace; click one to select it and view its
-  base, branch, path, and per-repo worktrees. Use **➕ New** to create a
-  workspace from a base, and **🗑 Remove** to tear one down.
+- **Workspaces** — every active workspace; click one to open a terminal rooted
+  at it (see [Terminal per workspace](#terminal-per-workspace)), or switch to
+  **Details** for its base, branch, path, and per-repo worktrees. Use **➕ New**
+  to create a workspace from a base, and **🗑 Remove** (in Details) to tear one
+  down.
 - **Settings** — the workspace root, default branch-from, and each base with
   its repos, `branch_from`, and `copy_files`. Use **➕ New base** to define one
   (browse for repo folders or type paths), **Edit** to add/remove its repos and
@@ -61,6 +63,21 @@ thread so the window stays responsive during `git fetch`/worktree work; a
 status bar shows progress and the result. Destructive actions ask for
 confirmation first. The list auto-refreshes when `~/.config/cutter` changes, or
 use **⟳ Refresh** to re-read manually.
+
+### Terminal per workspace
+
+Selecting a workspace opens a terminal rooted at that workspace's directory, so
+you land at a shell across your worktrees with no external terminal app. The
+pane has a **Terminal** / **Details** toggle at the top:
+
+- **Terminal** — an embedded terminal with tabs. Use **＋** to open another tab
+  (each is a fresh `$SHELL` in the workspace directory) and **✕** to close one.
+  Each workspace keeps its own independent set of terminal tabs.
+- **Details** — the workspace's base, branch, path, per-repo worktrees, linked
+  windows, and the **🗑 Remove** action.
+
+The terminal is an [`egui_term`](https://github.com/Harzu/egui_term) widget
+(alacritty's VT engine over a PTY), rendered inline in the Cutter window.
 
 > The GUI reads and writes the same `~/.config/cutter` data the CLI uses. To run
 > it without bundling, use `cargo run --features gui --bin cutter-gui`.

@@ -15,9 +15,14 @@ tabled = "0.17"
 chrono = { version = "0.4", features = ["serde"] }
 dialoguer = "0.11"
 serde_json = "1"
-eframe = { version = "0.31", optional = true }
+eframe = { version = "0.34", optional = true }
 notify-debouncer-mini = { version = "0.7.0", optional = true }
 rfd = { version = "0.15", optional = true }
+
+# Embedded terminal widget for the GUI: an egui widget backed by
+# alacritty_terminal for VT emulation + PTY. Pulled from git because the
+# published 0.1.0 targets an older egui; master tracks egui 0.34 to match eframe.
+egui_term = { git = "https://github.com/Harzu/egui_term", optional = true }
 
 # Window linking (GUI, macOS only): enumerate and raise other apps' windows via
 # the Accessibility API, ordered front-to-back via the CoreGraphics window list.
@@ -35,6 +40,7 @@ gui = [
     "dep:eframe",
     "dep:notify-debouncer-mini",
     "dep:rfd",
+    "dep:egui_term",
     "dep:accessibility-sys",
     "dep:core-foundation",
     "dep:core-foundation-sys",
