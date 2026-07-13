@@ -376,6 +376,11 @@ impl CutterApp {
         use std::collections::hash_map::Entry;
         let ctx = ui.ctx().clone();
 
+        // While a modal (e.g. the New-workspace dialog) is open, the terminal
+        // must not claim keyboard focus, or the modal's text fields can't be
+        // typed into (the terminal would grab focus back every frame).
+        let allow_focus = !self.any_modal_open();
+
         // The shell is rooted at the workspace directory.
         let Some(path) = self
             .workspaces
@@ -443,7 +448,7 @@ impl CutterApp {
             }
             let backend = &mut term.tabs[term.active].backend;
             let terminal = TerminalView::new(ui, backend)
-                .set_focus(true)
+                .set_focus(allow_focus)
                 .set_size(ui.available_size());
             ui.add(terminal);
         }
@@ -909,6 +914,16 @@ impl CutterApp {
             self.edit_error = None;
             self.show_edit_base = true;
         }
+    }
+
+    /// Whether any modal window/dialog is currently open. Used to keep the
+    /// embedded terminal from stealing keyboard focus from a modal's fields.
+    fn any_modal_open(&self) -> bool {
+        self.show_new_workspace
+            || self.show_new_base
+            || self.show_edit_base
+            || self.show_link_windows
+            || self.confirm_remove.is_some()
     }
 
     fn open_new_workspace(&mut self) {
