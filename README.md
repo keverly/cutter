@@ -90,10 +90,13 @@ click — useful when you keep, say, an Xcode window and its Simulator per
 workspace (including two windows of the *same* app for different workspaces).
 
 - In a workspace's detail pane, click **⧉ Link windows…**. Pick any open windows
-  from the list (multi-select — e.g. Xcode *and* the Simulator) and **Save**.
-  Workspaces with links show a `⧉` marker in the list.
-- **Click the workspace** to raise its linked windows to the foreground. The ✕
-  next to a link removes it.
+  from the list — including ones on **other Spaces (Mission Control desktops)**,
+  multi-select — e.g. Xcode *and* the Simulator) and **Save**. Workspaces with
+  links show a `⧉` marker in the list.
+- **Click the workspace** to raise its linked windows to the foreground. If a
+  linked window lives on another Space, Cutter **switches to that Space** first
+  (so clicking a workspace from Space 2 jumps you to Space 1 where its windows
+  are). The ✕ next to a link removes it.
 
 Links are stored per-workspace (in its `.toml`) as stable descriptors — the app
 name, window title, and the open document path when the app exposes one (e.g.
@@ -106,6 +109,14 @@ picker macOS will ask you to allow Cutter under **System Settings ▸ Privacy &
 Security ▸ Accessibility** (the picker has a button that opens the pane). The
 app is ad-hoc signed by `build-app.sh`; because that isn't a Developer ID
 signature, macOS may ask you to re-grant Accessibility after each rebuild.
+
+Enumerating windows across Spaces and switching Spaces use private CGS/SkyLight
+symbols (`SLSCopySpacesForWindows`, `SLSManagedDisplaySetCurrentSpace`, and
+`_AXUIElementGetWindow`) — the same undocumented APIs AltTab and yabai use.
+They need no extra permission, but they're unsupported by Apple and could change
+across major macOS releases; the SkyLight framework is linked in `build.rs`. If
+the Space layout can't be read, Cutter simply skips the Space switch and raises
+on the current Space.
 
 ## Quick Start
 

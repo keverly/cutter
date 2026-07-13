@@ -19,10 +19,14 @@ pub struct WorkspaceConfig {
 
 /// A descriptor for a macOS window linked to a workspace.
 ///
-/// Live window handles don't survive app restarts, so we persist identifying
-/// attributes and match them back to a real window at activation time:
-/// `document_path` (e.g. Xcode's open project) is the strongest signal, with
-/// the window `title` as a fallback.
+/// We match a link back to a real window at activation time using, in order of
+/// strength:
+/// 1. `window_id` — the CoreGraphics window id. Stable while the window exists
+///    (surviving tab/title changes and even Cutter restarts), so it's the
+///    primary signal; it only goes stale when the owning app closes/reopens the
+///    window and macOS reassigns ids.
+/// 2. `document_path` — e.g. Xcode's open project — stable across app restarts.
+/// 3. `title` — a last-resort fallback (volatile: Xcode rewrites it per tab).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LinkedWindow {
     /// Owning application name, e.g. "Xcode" (CoreGraphics owner name).
@@ -32,6 +36,10 @@ pub struct LinkedWindow {
     /// Document/file path the window has open, if the app exposes one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub document_path: Option<String>,
+    /// CoreGraphics window id captured at link time. Stable while the window
+    /// lives; `None` for older links saved before ids were tracked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_id: Option<u32>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
