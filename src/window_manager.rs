@@ -124,6 +124,12 @@ mod imp {
     /// Bound AX requests so an unresponsive app can't hang the UI.
     const AX_TIMEOUT_SECS: f32 = 0.25;
 
+    /// Set `CUTTER_DEBUG_WINDOWS=1` to log window enumeration and link matching
+    /// to stderr (visible when launching the binary from a terminal).
+    fn debug_enabled() -> bool {
+        std::env::var_os("CUTTER_DEBUG_WINDOWS").is_some()
+    }
+
     pub fn accessibility_trusted(prompt: bool) -> bool {
         unsafe {
             if !prompt {
@@ -160,6 +166,15 @@ mod imp {
                     document_path,
                     window_id,
                 });
+            }
+        }
+        if debug_enabled() {
+            eprintln!("[cutter] list_windows: {} candidate(s)", out.len());
+            for w in &out {
+                eprintln!(
+                    "[cutter]   pid={} app={:?} id={:?} doc={:?} title={:?}",
+                    w.pid, w.app_name, w.window_id, w.document_path, w.title
+                );
             }
         }
         out
@@ -322,6 +337,12 @@ mod imp {
 
         let mut best: Option<AXUIElementRef> = None;
         let mut best_score = 0u32;
+        if debug_enabled() {
+            eprintln!(
+                "[cutter] raise_in_app pid={} link(app={:?}, id={:?}, doc={:?}, title={:?})",
+                pid, link.app_name, link.window_id, link.document_path, link.title
+            );
+        }
         if let Some(windows) = copy_attr(app, kAXWindowsAttribute) {
             let windows_ref = windows.as_concrete_TypeRef() as CFArrayRef;
             let count = CFArrayGetCount(windows_ref);
@@ -334,6 +355,12 @@ mod imp {
                 let document = document_attr(window);
                 let wid = ax_window_id(window);
                 let score = match_score(link, &title, &document, wid);
+                if debug_enabled() {
+                    eprintln!(
+                        "[cutter]   candidate id={wid:?} doc={document:?} title={title:?} \
+                         score={score}"
+                    );
+                }
                 if score > best_score {
                     best_score = score;
                     best = Some(window);
@@ -367,9 +394,11 @@ mod imp {
     /// Score a candidate window against a link: 4 = window id match,
     /// 3 = document path match, 2 = exact title, 1 = title prefix, 0 = no match.
     ///
-    /// The id match is gated on the documents not actively disagreeing, so a
-    /// stale id that was reassigned to a *different* document after an app
-    /// restart doesn't win over a correct document-path match.
+    /// A window-id match is decisive: it's the same window regardless of how its
+    /// title or open document changed (e.g. Xcode rewrites both per tab). A
+    /// stale id can't cause a false positive because macOS assigns fresh,
+    /// monotonically increasing window ids after an app restart, so an old
+    /// stored id never equals a live window's id.
     fn match_score(
         link: &LinkedWindow,
         title: &str,
@@ -377,7 +406,7 @@ mod imp {
         wid: Option<u32>,
     ) -> u32 {
         if let (Some(want), Some(have)) = (link.window_id, wid) {
-            if want == have && !documents_conflict(&link.document_path, document) {
+            if want == have {
                 return 4;
             }
         }
@@ -397,11 +426,6 @@ mod imp {
             }
         }
         0
-    }
-
-    /// Whether two document paths are both present and different.
-    fn documents_conflict(a: &Option<String>, b: &Option<String>) -> bool {
-        matches!((a, b), (Some(a), Some(b)) if a != b)
     }
 
     unsafe fn set_true(element: AXUIElementRef, attribute: &str) {
