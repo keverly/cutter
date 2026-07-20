@@ -181,6 +181,20 @@ pub fn run(name: Option<&str>, base_name: Option<&str>, print: bool, claude_mode
     // Overlay base-level .claude directory on top of merged result
     overlay_base_claude_dir(&workspace_dir, &base_name, quiet)?;
 
+    // Install Claude Code session-status hooks so Cutter can show whether a
+    // session in this workspace is running or waiting for input. Runs after the
+    // base overlay, which rewrites settings.local.json and would otherwise drop
+    // the hooks. Best-effort: a failure here shouldn't fail workspace creation.
+    match crate::session::ensure_hooks(&workspace_dir) {
+        Ok(()) => info!(quiet, "  {} Installed session-status hooks", "✓".green()),
+        Err(e) => info!(
+            quiet,
+            "  {} Could not install session-status hooks: {}",
+            "!".yellow(),
+            e
+        ),
+    }
+
     let ws_config = WorkspaceConfig {
         workspace: WorkspaceInfo {
             name: name.to_string(),

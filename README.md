@@ -47,12 +47,14 @@ cp -r dist/Cutter.app /Applications/
 
 The window has two tabs:
 
-- **Workspaces** — every active workspace; click one to open a terminal rooted
-  at it (see [Terminal per workspace](#terminal-per-workspace)), or switch to
-  **Details** for its base, branch, path, and per-repo worktrees. Use **➕ New**
-  to create a workspace — either by describing it and letting Claude set it up
-  (see [AI-driven creation](#ai-driven-creation)) or by filling in a name and
-  base — and **🗑 Remove** (in Details) to tear one down.
+- **Workspaces** — every active workspace, each with a live **Claude status
+  dot**: green while a Claude Code session is running, amber when it's waiting
+  for your input (see [Claude session status](#claude-session-status)). Click one
+  to open a terminal rooted at it (see [Terminal per workspace](#terminal-per-workspace)),
+  or switch to **Details** for its base, branch, path, per-repo worktrees, and
+  any live sessions. Use **➕ New** to create a workspace — either by describing
+  it and letting Claude set it up (see [AI-driven creation](#ai-driven-creation))
+  or by filling in a name and base — and **🗑 Remove** (in Details) to tear one down.
 - **Settings** — the workspace root, default branch-from, and each base with
   its repos, `branch_from`, and `copy_files`. Use **➕ New base** to define one
   (browse for repo folders or type paths), **Edit** to add/remove its repos and
@@ -73,7 +75,9 @@ pane has a **Terminal** / **Details** toggle at the top:
 
 - **Terminal** — an embedded terminal with tabs. Use **＋** to open another tab
   (each is a fresh `$SHELL` in the workspace directory) and **✕** to close one.
-  Each workspace keeps its own independent set of terminal tabs.
+  Each workspace keeps its own independent set of terminal tabs. **Double-click a
+  tab** (or right-click ▸ **Rename**) to give it a custom name; the shell's own
+  title is used until you do, and renaming to an empty string restores it.
 - **Details** — the workspace's base, branch, path, per-repo worktrees, linked
   windows, and the **🗑 Remove** action.
 
@@ -82,6 +86,16 @@ The terminal is an [`egui_term`](https://github.com/Harzu/egui_term) widget
 
 > The GUI reads and writes the same `~/.config/cutter` data the CLI uses. To run
 > it without bundling, use `cargo run --features gui --bin cutter-gui`.
+
+### Standalone terminals
+
+Below the workspace list is a **Terminals** section for plain shells that aren't
+tied to any workspace — handy for a quick scratch terminal. Click **➕ New** to
+open one (a fresh `$SHELL` rooted at your home directory); it appears in the list
+as "Terminal 1", "Terminal 2", … Select it to bring it up in the main pane, and
+close it with the **✖** in the list, the **✖ Close** button in the pane, or by
+exiting the shell. **Double-click** an entry to rename it. These are ephemeral —
+they aren't saved across restarts.
 
 ### Linking macOS windows to a workspace
 
@@ -117,6 +131,27 @@ They need no extra permission, but they're unsupported by Apple and could change
 across major macOS releases; the SkyLight framework is linked in `build.rs`. If
 the Space layout can't be read, Cutter simply skips the Space switch and raises
 on the current Space.
+
+### Claude session status
+
+Each workspace shows whether a Claude Code session is live inside it: a **green**
+dot means Claude is running (working on your prompt), an **amber** dot means it's
+waiting for input (finished its turn, at a permission prompt, or idle at the
+prompt). The selected workspace shows the same status in its header, and its
+Details pane lists every live session. `cutter list` shows a **Claude** column
+too.
+
+This works via Claude Code **hooks**. When Cutter creates a workspace it installs
+a small set of hooks into that workspace's `.claude/settings.local.json`
+(`SessionStart`, `UserPromptSubmit`, `Stop`, `Notification`, `SessionEnd`), each
+running `cutter session-event …`. Those commands write a per-session record under
+`~/.config/cutter/sessions/`, which the GUI picks up through the same config-dir
+watcher it uses for everything else — so status updates are live, with no polling.
+Existing workspaces are retrofitted with the hooks automatically the next time the
+GUI reads them. The hooks are workspace-scoped, so they cover sessions launched at
+the workspace root (Cutter's embedded terminal, `cutter open-claude`,
+`cutter create --open-claude`); they merge alongside any hooks in your global
+`~/.claude/settings.json` rather than replacing them.
 
 ## Quick Start
 
@@ -288,8 +323,10 @@ If the base `.claude` directory doesn't exist, the step is skipped.
 │       └── .claude/
 │           ├── CLAUDE.md
 │           └── mcp.json
-└── workspaces/
-    └── my-feature.toml      # Per-workspace state
+├── workspaces/
+│   └── my-feature.toml      # Per-workspace state
+└── sessions/
+    └── <session-id>.json    # Live Claude session status (written by hooks)
 
 ~/cutter/
 └── my-feature/              # Workspace root

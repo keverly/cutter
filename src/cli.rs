@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -6,6 +6,22 @@ pub enum ClaudeMode {
     None,
     Normal,
     DangerouslySkipPermissions,
+}
+
+/// A Claude Code session lifecycle event, as reported by a hook. Value names are
+/// kebab-cased by clap (e.g. `SessionStart` -> `session-start`).
+#[derive(Debug, Clone, Copy, PartialEq, ValueEnum)]
+pub enum SessionEvent {
+    /// User submitted a prompt; Claude is now working.
+    PromptSubmit,
+    /// Claude finished its turn (idle at the prompt).
+    Stop,
+    /// Claude sent a notification (permission prompt or idle waiting).
+    Notification,
+    /// A session started.
+    SessionStart,
+    /// A session ended.
+    SessionEnd,
 }
 
 #[derive(Parser)]
@@ -83,6 +99,19 @@ pub enum Command {
         /// Use --dangerously-skip-permissions
         #[arg(long)]
         dangerous: bool,
+    },
+
+    /// Internal: record a Claude Code session lifecycle event. Invoked by the
+    /// hooks Cutter installs into each workspace; not meant to be run by hand.
+    #[command(hide = true)]
+    SessionEvent {
+        /// Which lifecycle event fired.
+        event: SessionEvent,
+
+        /// PID of the Claude process (from the hook's `$PPID`), used to prune
+        /// sessions that vanish without a clean SessionEnd.
+        #[arg(long)]
+        ppid: Option<i32>,
     },
 }
 

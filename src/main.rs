@@ -53,6 +53,10 @@ fn main() {
             };
             commands::open::run(&name, mode)
         }
+        Command::SessionEvent { event, ppid } => {
+            commands::session::run(event, ppid);
+            Ok(())
+        }
     };
 
     if let Err(e) = result {

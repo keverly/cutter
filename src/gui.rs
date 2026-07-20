@@ -11,8 +11,19 @@ use notify_debouncer_mini::{new_debouncer, DebounceEventResult, Debouncer};
 use crate::cli::ClaudeMode;
 use crate::commands;
 use crate::config::{config_dir, expand_tilde, Base, Config, RepoRef};
+use crate::session::{self, SessionRecord, SessionState, WorkspaceStatus};
 use crate::window_manager::{self, WindowInfo};
 use crate::workspace::{LinkedWindow, WorkspaceConfig};
+
+/// Claude "running" amber and "waiting for input" green, shared by the list
+/// icons, header chip, and details section.
+const RUNNING_COLOR: egui::Color32 = egui::Color32::from_rgb(0xff, 0xb0, 0x2e);
+const WAITING_COLOR: egui::Color32 = egui::Color32::from_rgb(0x3f, 0xb9, 0x50);
+
+/// Phosphor icon glyphs for each Claude status: a spinner ring for "running",
+/// a chat bubble with dots ("your turn to reply") for "waiting for input".
+const RUNNING_ICON: &str = egui_phosphor::regular::SPINNER_GAP;
+const WAITING_ICON: &str = egui_phosphor::regular::CHAT_CIRCLE_DOTS;
 
 /// Launch the standalone Cutter GUI window.
 pub fn run() -> eframe::Result<()> {
@@ -37,8 +48,20 @@ pub fn run() -> eframe::Result<()> {
     eframe::run_native(
         "Cutter",
         options,
-        Box::new(|cc| Ok(Box::new(CutterApp::new(&cc.egui_ctx)))),
+        Box::new(|cc| {
+            install_icon_font(&cc.egui_ctx);
+            Ok(Box::new(CutterApp::new(&cc.egui_ctx)))
+        }),
     )
+}
+
+/// Merge the Phosphor icon font into egui's fonts so the status glyphs render.
+/// It's added only as a fallback in the Proportional family, so the default
+/// text font and the embedded terminal's monospace rendering are untouched.
+fn install_icon_font(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+    ctx.set_fonts(fonts);
 }
 
 /// Watch `~/.config/cutter` (config.toml + workspaces/*.toml) and signal the UI
@@ -86,12 +109,30 @@ enum WorkspaceView {
 }
 
 /// One terminal tab within a workspace: a live PTY-backed terminal, its stable
-/// global id (used to route PTY events), and its current title (updated by the
-/// shell via OSC title sequences).
+/// global id (used to route PTY events), the shell-provided title (updated via
+/// OSC sequences), and an optional user-set name that overrides it.
 struct TermTab {
     id: u64,
     backend: TerminalBackend,
     title: String,
+    /// A name the user typed via rename; when set, it wins over the shell title.
+    custom_name: Option<String>,
+}
+
+impl TermTab {
+    /// The label to show: the user's name if they set one, else the shell title.
+    fn display_name(&self) -> String {
+        self.custom_name.clone().unwrap_or_else(|| self.title.clone())
+    }
+}
+
+/// An in-progress inline rename of a terminal (a workspace tab or a standalone
+/// terminal), keyed by the terminal's global PTY id.
+struct Renaming {
+    id: u64,
+    buffer: String,
+    /// Request keyboard focus for the edit field on its next render.
+    focus: bool,
 }
 
 /// The terminals belonging to a single workspace: the open tabs and the index
@@ -99,6 +140,23 @@ struct TermTab {
 struct WorkspaceTerminals {
     tabs: Vec<TermTab>,
     active: usize,
+}
+
+/// A standalone terminal not tied to any workspace — a plain shell rooted at the
+/// home directory, listed under "Terminals" in the left panel.
+struct ScratchTerminal {
+    /// Display name, e.g. "Terminal 1".
+    name: String,
+    /// The live PTY. Its `tab.id` doubles as the terminal's selection/routing id.
+    tab: TermTab,
+}
+
+/// What the central pane is showing: a workspace (by name) or a standalone
+/// terminal (by its PTY id).
+#[derive(Clone, PartialEq)]
+enum Selection {
+    Workspace(String),
+    Scratch(u64),
 }
 
 /// The target of a pending "are you sure?" confirmation.
@@ -149,7 +207,14 @@ struct CutterApp {
     // Workspaces
     workspaces: Vec<WorkspaceConfig>,
     workspaces_error: Option<String>,
-    selected: Option<String>,
+    selected: Option<Selection>,
+
+    // Live Claude Code session status, refreshed from ~/.config/cutter/sessions
+    // on every reload (the config-dir watcher wakes us when a hook writes one).
+    // `sessions` is the raw per-session list (for the details pane); `session_status`
+    // is the per-workspace aggregate (for the list dots and header chip).
+    sessions: Vec<SessionRecord>,
+    session_status: HashMap<String, WorkspaceStatus>,
 
     // Settings / config
     workspace_root: String,
@@ -212,6 +277,12 @@ struct CutterApp {
     // (handed out by `next_term_id`) so each event routes to exactly one tab.
     ws_view: WorkspaceView,
     terminals: HashMap<String, WorkspaceTerminals>,
+    // Standalone terminals not tied to any workspace, shown under "Terminals" in
+    // the left list. `next_scratch_num` names them "Terminal 1", "Terminal 2", …
+    scratch_terminals: Vec<ScratchTerminal>,
+    next_scratch_num: u32,
+    // In-progress inline rename of a terminal, if any (see `Renaming`).
+    renaming: Option<Renaming>,
     term_tx: Sender<(u64, PtyEvent)>,
     term_rx: Receiver<(u64, PtyEvent)>,
     next_term_id: u64,
@@ -225,6 +296,8 @@ impl CutterApp {
             workspaces: Vec::new(),
             workspaces_error: None,
             selected: None,
+            sessions: Vec::new(),
+            session_status: HashMap::new(),
             workspace_root: String::new(),
             default_branch_from: String::new(),
             bases: BTreeMap::new(),
@@ -259,6 +332,9 @@ impl CutterApp {
             fs_rx: None,
             ws_view: WorkspaceView::Terminal,
             terminals: HashMap::new(),
+            scratch_terminals: Vec::new(),
+            next_scratch_num: 1,
+            renaming: None,
             term_tx,
             term_rx,
             next_term_id: 0,
@@ -284,14 +360,33 @@ impl CutterApp {
             }
         }
 
-        // Preserve the current selection if it still exists, else select the first.
-        let still_present = self
-            .selected
-            .as_ref()
-            .is_some_and(|name| self.workspaces.iter().any(|w| &w.workspace.name == name));
+        // Preserve the current selection if it still exists, else select the
+        // first workspace. A selected standalone terminal is kept as long as it's
+        // still open (reload is driven by workspace/config changes, not terminals).
+        let still_present = match &self.selected {
+            Some(Selection::Workspace(name)) => {
+                self.workspaces.iter().any(|w| &w.workspace.name == name)
+            }
+            Some(Selection::Scratch(id)) => {
+                self.scratch_terminals.iter().any(|s| s.tab.id == *id)
+            }
+            None => false,
+        };
         if !still_present {
-            self.selected = self.workspaces.first().map(|w| w.workspace.name.clone());
+            self.selected = self
+                .workspaces
+                .first()
+                .map(|w| Selection::Workspace(w.workspace.name.clone()));
         }
+
+        // Keep the session-status hooks installed in every workspace. Idempotent
+        // and cheap (writes only when a hook is missing), so this also retrofits
+        // workspaces created before this feature existed.
+        for ws in &self.workspaces {
+            let _ = session::ensure_hooks(std::path::Path::new(&ws.workspace.path));
+        }
+        self.sessions = session::load_active(&self.workspaces);
+        self.session_status = session::aggregate(&self.sessions);
 
         match Config::load() {
             Ok(cfg) => {
@@ -305,8 +400,12 @@ impl CutterApp {
     }
 
     fn selected_workspace(&self) -> Option<&WorkspaceConfig> {
-        let name = self.selected.as_ref()?;
-        self.workspaces.iter().find(|w| &w.workspace.name == name)
+        match &self.selected {
+            Some(Selection::Workspace(name)) => {
+                self.workspaces.iter().find(|w| &w.workspace.name == name)
+            }
+            _ => None,
+        }
     }
 
     /// Spawn one PTY-backed terminal rooted at `path`, taking the next global
@@ -333,7 +432,12 @@ impl CutterApp {
             ..Default::default()
         };
         match TerminalBackend::new(id, ctx.clone(), tx.clone(), settings) {
-            Ok(backend) => Some(TermTab { id, backend, title }),
+            Ok(backend) => Some(TermTab {
+                id,
+                backend,
+                title,
+                custom_name: None,
+            }),
             Err(_) => None,
         }
     }
@@ -350,14 +454,21 @@ impl CutterApp {
                         return;
                     }
                 }
+                if let Some(s) = self.scratch_terminals.iter_mut().find(|s| s.tab.id == id) {
+                    s.tab.title = title;
+                }
             }
             _ => {}
         }
     }
 
-    /// Remove the terminal tab with `id` from whichever workspace owns it,
-    /// keeping that workspace's active index in range.
+    /// Remove the terminal tab with `id` from whichever workspace or standalone
+    /// terminal owns it, keeping any active index / selection in range.
     fn remove_term_by_id(&mut self, id: u64) {
+        // Drop any pending rename targeting the terminal being removed.
+        if self.renaming.as_ref().is_some_and(|r| r.id == id) {
+            self.renaming = None;
+        }
         for term in self.terminals.values_mut() {
             if let Some(pos) = term.tabs.iter().position(|t| t.id == id) {
                 term.tabs.remove(pos);
@@ -365,6 +476,13 @@ impl CutterApp {
                     term.active = term.tabs.len() - 1;
                 }
                 return;
+            }
+        }
+        if let Some(pos) = self.scratch_terminals.iter().position(|s| s.tab.id == id) {
+            self.scratch_terminals.remove(pos);
+            // If the closed terminal was selected, drop the selection.
+            if self.selected == Some(Selection::Scratch(id)) {
+                self.selected = None;
             }
         }
     }
@@ -376,10 +494,10 @@ impl CutterApp {
         use std::collections::hash_map::Entry;
         let ctx = ui.ctx().clone();
 
-        // While a modal (e.g. the New-workspace dialog) is open, the terminal
-        // must not claim keyboard focus, or the modal's text fields can't be
-        // typed into (the terminal would grab focus back every frame).
-        let allow_focus = !self.any_modal_open();
+        // While a modal is open or a terminal is being renamed, the terminal must
+        // not claim keyboard focus, or the modal/rename text field can't be typed
+        // into (the terminal would grab focus back every frame).
+        let allow_focus = !self.any_modal_open() && self.renaming.is_none();
 
         // The shell is rooted at the workspace directory.
         let Some(path) = self
@@ -409,18 +527,46 @@ impl CutterApp {
             }
         }
 
+        // Take any in-progress rename out of `self` so the edit field can be
+        // rendered without aliasing the `term` borrow below; written back at the
+        // end of the function.
+        let mut rename = self.renaming.take();
         let term = self.terminals.get_mut(ws_name).expect("just inserted");
 
         // --- tab strip ---
         let mut want_activate: Option<usize> = None;
         let mut want_close: Option<usize> = None;
         let mut want_add = false;
+        let mut want_start_rename: Option<u64> = None;
+        let mut commit_rename = false;
+        let mut cancel_rename = false;
         ui.horizontal(|ui| {
             for i in 0..term.tabs.len() {
-                let selected = i == term.active;
-                let title = term.tabs[i].title.clone();
-                if ui.selectable_label(selected, title).clicked() {
-                    want_activate = Some(i);
+                let tab_id = term.tabs[i].id;
+                let editing = rename.as_ref().is_some_and(|r| r.id == tab_id);
+                if editing {
+                    match rename_field(ui, rename.as_mut().unwrap(), 90.0) {
+                        Some(true) => commit_rename = true,
+                        Some(false) => cancel_rename = true,
+                        None => {}
+                    }
+                } else {
+                    let selected = i == term.active;
+                    let resp = ui
+                        .selectable_label(selected, term.tabs[i].display_name())
+                        .on_hover_text("Double-click to rename");
+                    if resp.clicked() {
+                        want_activate = Some(i);
+                    }
+                    if resp.double_clicked() {
+                        want_start_rename = Some(tab_id);
+                    }
+                    resp.context_menu(|ui| {
+                        if ui.button("Rename").clicked() {
+                            want_start_rename = Some(tab_id);
+                            ui.close();
+                        }
+                    });
                 }
                 // U+2716 (✖) and U+2795 (➕) below are glyphs egui's bundled
                 // fonts actually ship; plain "x"/"＋" (U+FF0B) render as tofu.
@@ -433,6 +579,27 @@ impl CutterApp {
                 want_add = true;
             }
         });
+        // Apply rename intents against the tab list.
+        if commit_rename {
+            if let Some(r) = rename.take() {
+                if let Some(t) = term.tabs.iter_mut().find(|t| t.id == r.id) {
+                    let n = r.buffer.trim();
+                    t.custom_name = (!n.is_empty()).then(|| n.to_string());
+                }
+            }
+        }
+        if cancel_rename {
+            rename = None;
+        }
+        if let Some(id) = want_start_rename {
+            if let Some(t) = term.tabs.iter().find(|t| t.id == id) {
+                rename = Some(Renaming {
+                    id,
+                    buffer: t.display_name(),
+                    focus: true,
+                });
+            }
+        }
         if let Some(i) = want_activate {
             term.active = i;
         }
@@ -456,6 +623,10 @@ impl CutterApp {
         // --- apply tab intents after rendering ---
         if let Some(i) = want_close {
             if i < term.tabs.len() {
+                // Drop a pending rename if it targets the tab being closed.
+                if rename.as_ref().is_some_and(|r| r.id == term.tabs[i].id) {
+                    rename = None;
+                }
                 term.tabs.remove(i);
                 if !term.tabs.is_empty() && term.active >= term.tabs.len() {
                     term.active = term.tabs.len() - 1;
@@ -469,6 +640,65 @@ impl CutterApp {
                 term.tabs.push(tab);
                 term.active = term.tabs.len() - 1;
             }
+        }
+
+        // Carry the (possibly updated) rename state back into `self`.
+        self.renaming = rename;
+    }
+
+    /// Open a new standalone terminal rooted at the user's home directory and
+    /// select it.
+    fn new_scratch_terminal(&mut self, ctx: &egui::Context) {
+        let home = dirs::home_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "/".to_string());
+        if let Some(tab) = Self::spawn_terminal(&mut self.next_term_id, ctx, &self.term_tx, &home) {
+            let id = tab.id;
+            let name = format!("Terminal {}", self.next_scratch_num);
+            self.next_scratch_num += 1;
+            self.scratch_terminals.push(ScratchTerminal { name, tab });
+            self.selected = Some(Selection::Scratch(id));
+        }
+    }
+
+    /// Render the selected standalone terminal filling the pane, with a header
+    /// showing its name and a Close button.
+    fn scratch_terminal_pane(&mut self, ui: &mut egui::Ui, id: u64) {
+        // Don't let this terminal grab focus while a modal is open or a rename is
+        // in progress (the rename field lives in the left panel).
+        let allow_focus = !self.any_modal_open() && self.renaming.is_none();
+        let Some(idx) = self.scratch_terminals.iter().position(|s| s.tab.id == id) else {
+            ui.centered_and_justified(|ui| {
+                ui.label(egui::RichText::new("Terminal closed").weak());
+            });
+            return;
+        };
+        let name = self.scratch_terminals[idx].name.clone();
+
+        ui.add_space(6.0);
+        let mut want_close = false;
+        ui.horizontal(|ui| {
+            ui.heading(&name);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .button("✖ Close")
+                    .on_hover_text("Close this terminal")
+                    .clicked()
+                {
+                    want_close = true;
+                }
+            });
+        });
+        ui.separator();
+
+        let backend = &mut self.scratch_terminals[idx].tab.backend;
+        let terminal = TerminalView::new(ui, backend)
+            .set_focus(allow_focus)
+            .set_size(ui.available_size());
+        ui.add(terminal);
+
+        if want_close {
+            self.remove_term_by_id(id);
         }
     }
 
@@ -519,7 +749,7 @@ impl CutterApp {
             PendingAction::CreateWorkspace { name, base } => {
                 let label = format!("Creating workspace '{name}'…");
                 // Optimistically select it; reload keeps the selection if it landed.
-                self.selected = Some(name.clone());
+                self.selected = Some(Selection::Workspace(name.clone()));
                 let display = name.clone();
                 self.start_job(ctx, label, move || {
                     commands::create::run(Some(&name), Some(&base), false, ClaudeMode::None)
@@ -547,121 +777,278 @@ impl CutterApp {
     }
 
     fn workspaces_ui(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
         let job_active = self.job.is_some();
         let mut want_remove_ws: Option<String> = None;
-        // A list item was clicked this frame → raise that workspace's windows.
+        // A workspace item was clicked this frame → raise its windows.
         let mut raise_request: Option<String> = None;
         // Detail-pane intents for the selected workspace.
         let mut open_link = false;
         let mut unlink_idx: Option<usize> = None;
+        // Standalone-terminal intents, applied after the panels render.
+        let mut new_scratch = false;
+        let mut close_scratch: Option<u64> = None;
+        let mut start_scratch_rename: Option<(u64, String)> = None;
+        let mut commit_scratch_rename: Option<u64> = None;
+        let mut cancel_scratch_rename = false;
 
         egui::Panel::left("workspace_list")
             .resizable(true)
             .default_size(220.0)
             .show_inside(ui, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    // --- Workspaces ---
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!("Workspaces ({})", self.workspaces.len()))
+                                .strong(),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .add_enabled(!job_active, egui::Button::new("➕ New"))
+                                .on_hover_text("Create a workspace")
+                                .clicked()
+                            {
+                                self.open_new_workspace();
+                            }
+                        });
+                    });
+                    ui.separator();
+
+                    if let Some(err) = &self.workspaces_error {
+                        ui.colored_label(egui::Color32::RED, err);
+                    } else if self.workspaces.is_empty() {
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new("No workspaces yet. Use ➕ New.").weak());
+                    } else {
+                        // Snapshot names first so we can mutate `selected` while iterating.
+                        let names: Vec<String> =
+                            self.workspaces.iter().map(|w| w.workspace.name.clone()).collect();
+                        for name in names {
+                            let is_selected = matches!(
+                                &self.selected,
+                                Some(Selection::Workspace(n)) if n == &name
+                            );
+                            // Show a small ⧉ marker on workspaces that have links.
+                            let has_links = self
+                                .workspaces
+                                .iter()
+                                .find(|w| w.workspace.name == name)
+                                .is_some_and(|w| !w.linked_windows.is_empty());
+                            let label = if has_links {
+                                format!("⧉  {name}")
+                            } else {
+                                name.clone()
+                            };
+                            let status =
+                                self.session_status.get(&name).copied().unwrap_or_default();
+                            let clicked = ui
+                                .horizontal(|ui| {
+                                    // A leading icon shows Claude's status in a
+                                    // fixed-width slot so names stay aligned; idle
+                                    // workspaces leave the slot empty.
+                                    let slot = egui::vec2(18.0, 16.0);
+                                    match status.state() {
+                                        Some(state) => {
+                                            let (icon, color) = state_icon(state);
+                                            ui.add_sized(
+                                                slot,
+                                                egui::Label::new(
+                                                    egui::RichText::new(icon).color(color),
+                                                ),
+                                            )
+                                            .on_hover_text(status_hover(state, status));
+                                        }
+                                        None => {
+                                            ui.add_sized(slot, egui::Label::new(""));
+                                        }
+                                    }
+                                    ui.selectable_label(is_selected, label).clicked()
+                                })
+                                .inner;
+                            if clicked {
+                                self.selected = Some(Selection::Workspace(name.clone()));
+                                // Clicking activates the workspace's linked windows.
+                                raise_request = Some(name);
+                            }
+                        }
+                    }
+
+                    // --- Standalone terminals ---
+                    ui.add_space(14.0);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Terminals ({})",
+                                self.scratch_terminals.len()
+                            ))
+                            .strong(),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .button("➕ New")
+                                .on_hover_text("Open a standalone terminal (not tied to a workspace)")
+                                .clicked()
+                            {
+                                new_scratch = true;
+                            }
+                        });
+                    });
+                    ui.separator();
+
+                    if self.scratch_terminals.is_empty() {
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new("A plain shell rooted at your home directory.")
+                                .weak(),
+                        );
+                    } else {
+                        // Snapshot ids/names so we can mutate `selected` while iterating.
+                        let entries: Vec<(u64, String)> = self
+                            .scratch_terminals
+                            .iter()
+                            .map(|s| (s.tab.id, s.name.clone()))
+                            .collect();
+                        for (id, tname) in entries {
+                            let is_selected = self.selected == Some(Selection::Scratch(id));
+                            let editing = self.renaming.as_ref().is_some_and(|r| r.id == id);
+                            let clicked = ui
+                                .horizontal(|ui| {
+                                    if ui
+                                        .small_button("✖")
+                                        .on_hover_text("Close terminal")
+                                        .clicked()
+                                    {
+                                        close_scratch = Some(id);
+                                    }
+                                    if editing {
+                                        match rename_field(
+                                            ui,
+                                            self.renaming.as_mut().unwrap(),
+                                            130.0,
+                                        ) {
+                                            Some(true) => commit_scratch_rename = Some(id),
+                                            Some(false) => cancel_scratch_rename = true,
+                                            None => {}
+                                        }
+                                        false
+                                    } else {
+                                        let resp = ui
+                                            .selectable_label(is_selected, tname.clone())
+                                            .on_hover_text("Double-click to rename");
+                                        if resp.double_clicked() {
+                                            start_scratch_rename = Some((id, tname.clone()));
+                                        }
+                                        resp.clicked()
+                                    }
+                                })
+                                .inner;
+                            if clicked {
+                                self.selected = Some(Selection::Scratch(id));
+                            }
+                        }
+                    }
+                });
+            });
+
+        egui::CentralPanel::default().show_inside(ui, |ui| match self.selected.clone() {
+            Some(Selection::Workspace(name)) => {
+                // Header: workspace name + Claude status chip + Terminal/Details toggle.
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(format!("Workspaces ({})", self.workspaces.len()))
-                            .strong(),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .add_enabled(!job_active, egui::Button::new("➕ New"))
-                            .on_hover_text("Create a workspace")
-                            .clicked()
-                        {
-                            self.open_new_workspace();
+                    ui.heading(&name);
+                    if let Some(state) = self.session_status.get(&name).and_then(|s| s.state()) {
+                        match state {
+                            SessionState::Running => {
+                                // A live spinner reads as activity; the Spinner
+                                // widget requests its own repaints while visible.
+                                ui.add(egui::Spinner::new().size(15.0).color(RUNNING_COLOR));
+                                ui.colored_label(RUNNING_COLOR, "running");
+                            }
+                            SessionState::Waiting => {
+                                ui.colored_label(
+                                    WAITING_COLOR,
+                                    format!("{WAITING_ICON} waiting for input"),
+                                );
+                            }
                         }
+                    }
+                    // Anchor the view toggle to the right so it stays put as the
+                    // status chip's text changes width. In a right-to-left layout
+                    // the first widget lands rightmost, so add Details before Terminal.
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.selectable_value(&mut self.ws_view, WorkspaceView::Details, "Details");
+                        ui.selectable_value(&mut self.ws_view, WorkspaceView::Terminal, "Terminal");
                     });
                 });
                 ui.separator();
 
-                if let Some(err) = &self.workspaces_error {
-                    ui.colored_label(egui::Color32::RED, err);
-                    return;
-                }
-                if self.workspaces.is_empty() {
-                    ui.add_space(8.0);
-                    ui.label("No workspaces yet.");
-                    ui.label(egui::RichText::new("Use ➕ New to create one.").weak());
-                    return;
-                }
-
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    // Snapshot names first so we can mutate `selected` while iterating.
-                    let names: Vec<String> =
-                        self.workspaces.iter().map(|w| w.workspace.name.clone()).collect();
-                    for name in names {
-                        let is_selected = self.selected.as_deref() == Some(name.as_str());
-                        // Show a small ⧉ marker on workspaces that have links.
-                        let has_links = self
-                            .workspaces
-                            .iter()
-                            .find(|w| w.workspace.name == name)
-                            .is_some_and(|w| !w.linked_windows.is_empty());
-                        let label = if has_links {
-                            format!("⧉  {name}")
-                        } else {
-                            name.clone()
-                        };
-                        if ui.selectable_label(is_selected, label).clicked() {
-                            self.selected = Some(name.clone());
-                            // Clicking activates the workspace's linked windows.
-                            raise_request = Some(name);
+                match self.ws_view {
+                    WorkspaceView::Terminal => self.terminal_pane(ui, &name),
+                    WorkspaceView::Details => match self.selected_workspace() {
+                        Some(ws) => Self::workspace_details(
+                            ui,
+                            ws,
+                            &self.sessions,
+                            job_active,
+                            &mut want_remove_ws,
+                            &mut open_link,
+                            &mut unlink_idx,
+                        ),
+                        None => {
+                            ui.centered_and_justified(|ui| {
+                                ui.label(egui::RichText::new("Select a workspace").weak());
+                            });
                         }
-                    }
-                });
-            });
-
-        egui::CentralPanel::default().show_inside(ui, |ui| {
-            let Some(name) = self.selected.clone() else {
+                    },
+                }
+            }
+            Some(Selection::Scratch(id)) => self.scratch_terminal_pane(ui, id),
+            None => {
                 ui.centered_and_justified(|ui| {
-                    ui.label(egui::RichText::new("Select a workspace").weak());
+                    ui.label(egui::RichText::new("Select a workspace or terminal").weak());
                 });
-                return;
-            };
-
-            // Header: workspace name + Terminal/Details view toggle.
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.heading(&name);
-                ui.separator();
-                ui.selectable_value(&mut self.ws_view, WorkspaceView::Terminal, "Terminal");
-                ui.selectable_value(&mut self.ws_view, WorkspaceView::Details, "Details");
-            });
-            ui.separator();
-
-            match self.ws_view {
-                WorkspaceView::Terminal => self.terminal_pane(ui, &name),
-                WorkspaceView::Details => match self.selected_workspace() {
-                    Some(ws) => Self::workspace_details(
-                        ui,
-                        ws,
-                        job_active,
-                        &mut want_remove_ws,
-                        &mut open_link,
-                        &mut unlink_idx,
-                    ),
-                    None => {
-                        ui.centered_and_justified(|ui| {
-                            ui.label(egui::RichText::new("Select a workspace").weak());
-                        });
-                    }
-                },
             }
         });
 
+        if new_scratch {
+            self.new_scratch_terminal(&ctx);
+        }
+        if let Some(id) = close_scratch {
+            self.remove_term_by_id(id);
+        }
+        // Standalone-terminal rename: commit/cancel first, then start a new one.
+        if let Some(id) = commit_scratch_rename {
+            if let Some(r) = self.renaming.take() {
+                if let Some(s) = self.scratch_terminals.iter_mut().find(|s| s.tab.id == id) {
+                    let n = r.buffer.trim();
+                    if !n.is_empty() {
+                        s.name = n.to_string();
+                    }
+                }
+            }
+        }
+        if cancel_scratch_rename {
+            self.renaming = None;
+        }
+        if let Some((id, current)) = start_scratch_rename {
+            self.renaming = Some(Renaming {
+                id,
+                buffer: current,
+                focus: true,
+            });
+        }
         if let Some(name) = want_remove_ws {
             self.confirm_remove = Some(RemoveTarget::Workspace(name));
         }
         if open_link {
-            if let Some(name) = self.selected.clone() {
+            if let Some(Selection::Workspace(name)) = self.selected.clone() {
                 self.open_link_windows(name);
             }
         }
         if let Some(idx) = unlink_idx {
-            if let Some(name) = self.selected.clone() {
+            if let Some(Selection::Workspace(name)) = self.selected.clone() {
                 self.unlink_window(&name, idx);
             }
         }
@@ -673,6 +1060,7 @@ impl CutterApp {
     fn workspace_details(
         ui: &mut egui::Ui,
         ws: &WorkspaceConfig,
+        sessions: &[SessionRecord],
         job_active: bool,
         want_remove: &mut Option<String>,
         open_link: &mut bool,
@@ -710,6 +1098,36 @@ impl CutterApp {
                     ui.label(egui::RichText::new(ws.workspace.path.as_str()).monospace());
                     ui.end_row();
                 });
+
+            // Live Claude Code sessions running in this workspace.
+            let ws_sessions: Vec<&SessionRecord> = sessions
+                .iter()
+                .filter(|s| s.workspace == ws.workspace.name)
+                .collect();
+            if !ws_sessions.is_empty() {
+                ui.add_space(12.0);
+                ui.label(
+                    egui::RichText::new(format!("Claude sessions ({})", ws_sessions.len()))
+                        .strong(),
+                );
+                ui.separator();
+                for s in ws_sessions {
+                    ui.add_space(2.0);
+                    ui.horizontal(|ui| {
+                        let (icon, color) = state_icon(s.state);
+                        ui.colored_label(color, icon);
+                        ui.label(s.state.label());
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "· updated {}",
+                                s.updated_at.format("%H:%M:%S UTC")
+                            ))
+                            .weak(),
+                        );
+                    });
+                    ui.label(egui::RichText::new(s.cwd.as_str()).monospace().weak().small());
+                }
+            }
 
             ui.add_space(12.0);
             ui.label(egui::RichText::new(format!("Repos ({})", ws.repos.len())).strong());
@@ -1664,6 +2082,7 @@ impl eframe::App for CutterApp {
         // Closing the window: drop all terminals so their shells terminate.
         if ctx.input(|i| i.viewport().close_requested()) {
             self.terminals.clear();
+            self.scratch_terminals.clear();
         }
 
         // Route any terminal PTY events (title changes, shell exits) collected
@@ -1773,4 +2192,37 @@ fn meta_row(ui: &mut egui::Ui, label: &str, value: &str) {
     ui.label(egui::RichText::new(label).strong());
     ui.label(value);
     ui.end_row();
+}
+
+/// The Phosphor icon glyph and colour used to render a Claude session state.
+fn state_icon(state: SessionState) -> (&'static str, egui::Color32) {
+    match state {
+        SessionState::Running => (RUNNING_ICON, RUNNING_COLOR),
+        SessionState::Waiting => (WAITING_ICON, WAITING_COLOR),
+    }
+}
+
+/// Draw the inline rename text field for a terminal. Requests focus on the first
+/// render, then returns `Some(true)` to commit (Enter or click-away),
+/// `Some(false)` to cancel (Escape), or `None` while still editing.
+fn rename_field(ui: &mut egui::Ui, r: &mut Renaming, width: f32) -> Option<bool> {
+    let resp = ui.add(egui::TextEdit::singleline(&mut r.buffer).desired_width(width));
+    if r.focus {
+        resp.request_focus();
+        r.focus = false;
+    }
+    if resp.lost_focus() {
+        // Escape cancels; Enter or clicking elsewhere commits.
+        return Some(!ui.input(|i| i.key_pressed(egui::Key::Escape)));
+    }
+    None
+}
+
+/// Hover text for a workspace's status icon, e.g. "Claude: running (2)".
+fn status_hover(state: SessionState, status: WorkspaceStatus) -> String {
+    let n = match state {
+        SessionState::Running => status.running,
+        SessionState::Waiting => status.waiting,
+    };
+    format!("Claude: {} ({})", state.label(), n)
 }

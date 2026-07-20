@@ -15,6 +15,7 @@ tabled = "0.17"
 chrono = { version = "0.4", features = ["serde"] }
 dialoguer = "0.11"
 serde_json = "1"
+libc = "0.2"
 eframe = { version = "0.34", optional = true }
 notify-debouncer-mini = { version = "0.7.0", optional = true }
 rfd = { version = "0.15", optional = true }
@@ -33,6 +34,7 @@ accessibility-sys = { version = "0.1", optional = true }
 core-foundation = { version = "0.10", optional = true }
 core-foundation-sys = { version = "0.8", optional = true }
 core-graphics = { version = "0.24", optional = true }
+egui-phosphor = { version = "0.12", optional = true }
 
 [features]
 # Builds the standalone Cutter.app GUI (the `cutter-gui` binary).
@@ -41,6 +43,7 @@ gui = [
     "dep:notify-debouncer-mini",
     "dep:rfd",
     "dep:egui_term",
+    "dep:egui-phosphor",
     "dep:accessibility-sys",
     "dep:core-foundation",
     "dep:core-foundation-sys",
