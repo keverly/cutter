@@ -4,7 +4,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
 use eframe::egui;
-use egui_term::{PtyEvent, TerminalBackend, TerminalView};
+use egui_term::{BackendCommand, PtyEvent, TerminalBackend, TerminalView};
 use notify_debouncer_mini::notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_mini::{new_debouncer, DebounceEventResult, Debouncer};
 
@@ -118,6 +118,9 @@ struct TermTab {
     title: String,
     /// A name the user typed via rename; when set, it wins over the shell title.
     custom_name: Option<String>,
+    /// Fractional scrollback lines accumulated from smooth wheel deltas, so slow
+    /// trackpad scrolling isn't rounded away.
+    scroll_accum: f32,
 }
 
 impl TermTab {
@@ -448,6 +451,7 @@ impl CutterApp {
                 backend,
                 title,
                 custom_name: None,
+                scroll_accum: 0.0,
             }),
             Err(_) => None,
         }
@@ -624,11 +628,20 @@ impl CutterApp {
             if term.active >= term.tabs.len() {
                 term.active = term.tabs.len() - 1;
             }
-            let backend = &mut term.tabs[term.active].backend;
-            let terminal = TerminalView::new(ui, backend)
+            let region = ui.available_rect_before_wrap();
+            let tab = &mut term.tabs[term.active];
+            let scroll = if allow_focus {
+                take_terminal_scroll(ui, region, &mut tab.scroll_accum)
+            } else {
+                0
+            };
+            let terminal = TerminalView::new(ui, &mut tab.backend)
                 .set_focus(allow_focus)
                 .set_size(ui.available_size());
             ui.add(terminal);
+            if scroll != 0 {
+                tab.backend.process_command(BackendCommand::Scroll(scroll));
+            }
         }
 
         // --- apply tab intents after rendering ---
@@ -702,11 +715,20 @@ impl CutterApp {
         });
         ui.separator();
 
-        let backend = &mut self.scratch_terminals[idx].tab.backend;
-        let terminal = TerminalView::new(ui, backend)
+        let region = ui.available_rect_before_wrap();
+        let tab = &mut self.scratch_terminals[idx].tab;
+        let scroll = if allow_focus {
+            take_terminal_scroll(ui, region, &mut tab.scroll_accum)
+        } else {
+            0
+        };
+        let terminal = TerminalView::new(ui, &mut tab.backend)
             .set_focus(allow_focus)
             .set_size(ui.available_size());
         ui.add(terminal);
+        if scroll != 0 {
+            tab.backend.process_command(BackendCommand::Scroll(scroll));
+        }
 
         if want_close {
             self.remove_term_by_id(id);
@@ -2274,6 +2296,38 @@ fn state_icon(state: SessionState) -> (&'static str, egui::Color32) {
         SessionState::Running => (RUNNING_ICON, RUNNING_COLOR),
         SessionState::Waiting => (WAITING_ICON, WAITING_COLOR),
     }
+}
+
+/// Mouse-wheel scrollback for an embedded terminal. `egui_term`'s own wheel
+/// handling is gated on the widget holding keyboard focus, which is unreliable in
+/// a multi-pane layout, so we drive the scrollback directly whenever the terminal
+/// region is hovered. Returns the number of lines to scroll (positive = back into
+/// history) and consumes the wheel input so `egui_term` doesn't also act on it.
+///
+/// Call this *before* adding the `TerminalView` (so the consume lands first) and
+/// feed the result to the backend afterwards. `accum` carries the sub-line
+/// remainder between frames so slow scrolling still moves.
+fn take_terminal_scroll(ui: &egui::Ui, region: egui::Rect, accum: &mut f32) -> i32 {
+    if !ui.rect_contains_pointer(region) {
+        return 0;
+    }
+    let dy = ui.input(|i| i.smooth_scroll_delta.y);
+    if dy == 0.0 {
+        return 0;
+    }
+    // Consume the wheel so egui_term's (focus-gated) handler and any ancestor
+    // ScrollArea don't also react to it.
+    ui.input_mut(|i| {
+        i.smooth_scroll_delta = egui::Vec2::ZERO;
+        i.events.retain(|e| !matches!(e, egui::Event::MouseWheel { .. }));
+    });
+    // Approximate line height for egui_term's default monospace-14 font (points).
+    // Only affects scroll speed, so an approximation is fine.
+    const ROW_HEIGHT: f32 = 16.5;
+    *accum += dy / ROW_HEIGHT;
+    let lines = accum.trunc();
+    *accum -= lines;
+    lines as i32
 }
 
 /// Draw the inline rename text field for a terminal. Requests focus on the first
