@@ -159,6 +159,19 @@ the workspace root (Cutter's embedded terminal, `cutter open-claude`,
 `cutter create --open-claude`); they merge alongside any hooks in your global
 `~/.claude/settings.json` rather than replacing them.
 
+### Pull-request status
+
+When a workspace's repos have pull requests open for the workspace branch, their
+numbers appear as chips under the workspace name — coloured by status (**grey**
+draft, **green** open, **purple** merged) and linking straight to GitHub. Repos
+are queried independently, so a multi-repo workspace can show several PRs at once;
+workspaces with nothing in flight show nothing.
+
+This uses the [`gh`](https://cli.github.com) CLI (`gh pr list --head <branch>`)
+per repo, fetched in the background and cached, so it needs `gh` installed and
+authenticated. Repos without a GitHub remote simply contribute no chips. Hit
+**⟳ Refresh** to re-query.
+
 ## Quick Start
 
 ```sh

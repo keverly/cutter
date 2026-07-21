@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
@@ -12,6 +12,7 @@ use crate::ai_link;
 use crate::cli::ClaudeMode;
 use crate::commands;
 use crate::config::{config_dir, expand_tilde, Base, Config, RepoRef};
+use crate::pr;
 use crate::session::{self, SessionRecord, SessionState, WorkspaceStatus};
 use crate::window_manager::{self, WindowInfo};
 use crate::workspace::{LinkedWindow, WorkspaceConfig};
@@ -25,6 +26,11 @@ const WAITING_COLOR: egui::Color32 = egui::Color32::from_rgb(0x3f, 0xb9, 0x50);
 /// a chat bubble with dots ("your turn to reply") for "waiting for input".
 const RUNNING_ICON: &str = egui_phosphor::regular::SPINNER_GAP;
 const WAITING_ICON: &str = egui_phosphor::regular::CHAT_CIRCLE_DOTS;
+
+/// PR-status chip colours: draft grey, open green, merged purple.
+const PR_DRAFT_COLOR: egui::Color32 = egui::Color32::from_rgb(0x8b, 0x94, 0x9e);
+const PR_OPEN_COLOR: egui::Color32 = egui::Color32::from_rgb(0x3f, 0xb9, 0x50);
+const PR_MERGED_COLOR: egui::Color32 = egui::Color32::from_rgb(0x8b, 0x5c, 0xf6);
 
 /// Launch the standalone Cutter GUI window.
 pub fn run() -> eframe::Result<()> {
@@ -230,6 +236,14 @@ struct CutterApp {
     sessions: Vec<SessionRecord>,
     session_status: HashMap<String, WorkspaceStatus>,
 
+    // GitHub PR status per workspace, fetched lazily off-thread via `gh` and
+    // cached. `pr_fetching` guards against duplicate in-flight fetches; results
+    // arrive on `pr_rx`.
+    pr_status: HashMap<String, Vec<pr::PrInfo>>,
+    pr_fetching: HashSet<String>,
+    pr_tx: Sender<(String, Vec<pr::PrInfo>)>,
+    pr_rx: Receiver<(String, Vec<pr::PrInfo>)>,
+
     // Settings / config
     workspace_root: String,
     default_branch_from: String,
@@ -305,6 +319,7 @@ struct CutterApp {
 impl CutterApp {
     fn new(ctx: &egui::Context) -> Self {
         let (term_tx, term_rx) = std::sync::mpsc::channel();
+        let (pr_tx, pr_rx) = std::sync::mpsc::channel();
         let mut app = Self {
             tab: Tab::Workspaces,
             workspaces: Vec::new(),
@@ -312,6 +327,10 @@ impl CutterApp {
             selected: None,
             sessions: Vec::new(),
             session_status: HashMap::new(),
+            pr_status: HashMap::new(),
+            pr_fetching: HashSet::new(),
+            pr_tx,
+            pr_rx,
             workspace_root: String::new(),
             default_branch_from: String::new(),
             bases: BTreeMap::new(),
@@ -822,6 +841,8 @@ impl CutterApp {
         let mut start_scratch_rename: Option<(u64, String)> = None;
         let mut commit_scratch_rename: Option<u64> = None;
         let mut cancel_scratch_rename = false;
+        // A workspace whose PR status needs fetching (lazy, once per workspace).
+        let mut pr_fetch_request: Option<String> = None;
 
         egui::Panel::left("workspace_list")
             .resizable(true)
@@ -1013,6 +1034,37 @@ impl CutterApp {
                         ui.selectable_value(&mut self.ws_view, WorkspaceView::Terminal, "Terminal");
                     });
                 });
+
+                // PR chips under the workspace name (one per in-flight PR across
+                // the repos), coloured by status and linking to GitHub. Fetched
+                // lazily the first time the workspace is shown.
+                match self.pr_status.get(&name) {
+                    Some(prs) if !prs.is_empty() => {
+                        ui.horizontal(|ui| {
+                            for p in prs {
+                                ui.hyperlink_to(
+                                    egui::RichText::new(format!("#{}", p.number))
+                                        .color(pr_color(p.state))
+                                        .strong(),
+                                    &p.url,
+                                )
+                                .on_hover_text(format!(
+                                    "{} · {} ({})",
+                                    p.repo,
+                                    p.title,
+                                    p.state.label()
+                                ));
+                            }
+                        });
+                    }
+                    Some(_) => {} // fetched, none in flight → show nothing
+                    None => {
+                        if !self.pr_fetching.contains(&name) {
+                            pr_fetch_request = Some(name.clone());
+                        }
+                    }
+                }
+
                 ui.separator();
 
                 match self.ws_view {
@@ -1080,6 +1132,9 @@ impl CutterApp {
             if let Some(Selection::Workspace(name)) = self.selected.clone() {
                 self.start_ai_link(&ctx, name);
             }
+        }
+        if let Some(name) = pr_fetch_request {
+            self.start_pr_fetch(&ctx, name);
         }
         if let Some(idx) = actions.unlink_idx {
             if let Some(Selection::Workspace(name)) = self.selected.clone() {
@@ -1394,6 +1449,36 @@ impl CutterApp {
         if self.new_ws_ai_base.is_none() {
             self.new_ws_ai_base = first_base;
         }
+    }
+
+    /// Fetch GitHub PR status for a workspace's repos off the UI thread (a `gh`
+    /// call per repo), caching the result. No-op if already cached or in flight.
+    fn start_pr_fetch(&mut self, ctx: &egui::Context, ws_name: String) {
+        if self.pr_fetching.contains(&ws_name) || self.pr_status.contains_key(&ws_name) {
+            return;
+        }
+        let Some(ws) = self.workspaces.iter().find(|w| w.workspace.name == ws_name) else {
+            return;
+        };
+        let repos: Vec<(String, String)> = ws
+            .repos
+            .iter()
+            .map(|r| (r.name.clone(), r.worktree_path.clone()))
+            .collect();
+        if repos.is_empty() {
+            // Nothing to query; record an empty result so we don't retry.
+            self.pr_status.insert(ws_name, Vec::new());
+            return;
+        }
+        let branch = ws.workspace.branch.clone();
+        self.pr_fetching.insert(ws_name.clone());
+        let tx = self.pr_tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let prs = pr::fetch(&repos, &branch);
+            let _ = tx.send((ws_name, prs));
+            ctx.request_repaint();
+        });
     }
 
     /// Auto-link windows to `ws_name`: enumerate the live windows on the UI
@@ -2188,6 +2273,12 @@ impl eframe::App for CutterApp {
             self.on_term_event(id, event);
         }
 
+        // Collect any finished PR-status fetches.
+        while let Ok((name, prs)) = self.pr_rx.try_recv() {
+            self.pr_fetching.remove(&name);
+            self.pr_status.insert(name, prs);
+        }
+
         // A finished background job: surface its outcome and re-read from disk.
         if let Some(rx) = &self.job_rx {
             if let Ok(outcome) = rx.try_recv() {
@@ -2218,6 +2309,9 @@ impl eframe::App for CutterApp {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("⟳ Refresh").clicked() {
                         do_refresh = true;
+                        // Drop cached PR status so the selected workspace refetches.
+                        self.pr_status.clear();
+                        self.pr_fetching.clear();
                     }
                 });
             });
@@ -2344,6 +2438,15 @@ fn rename_field(ui: &mut egui::Ui, r: &mut Renaming, width: f32) -> Option<bool>
         return Some(!ui.input(|i| i.key_pressed(egui::Key::Escape)));
     }
     None
+}
+
+/// The chip colour for a PR status.
+fn pr_color(state: pr::PrState) -> egui::Color32 {
+    match state {
+        pr::PrState::Draft => PR_DRAFT_COLOR,
+        pr::PrState::Open => PR_OPEN_COLOR,
+        pr::PrState::Merged => PR_MERGED_COLOR,
+    }
 }
 
 /// Hover text for a workspace's status icon, e.g. "Claude: running (2)".

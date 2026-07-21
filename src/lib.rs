@@ -13,4 +13,7 @@ pub mod ai_link;
 pub mod gui;
 
 #[cfg(feature = "gui")]
+pub mod pr;
+
+#[cfg(feature = "gui")]
 pub mod window_manager;
