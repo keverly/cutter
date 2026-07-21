@@ -107,6 +107,12 @@ workspace (including two windows of the *same* app for different workspaces).
   from the list — including ones on **other Spaces (Mission Control desktops)**,
   multi-select — e.g. Xcode *and* the Simulator) and **Save**. Workspaces with
   links show a `⧉` marker in the list.
+- Or click **🤖 Auto-link** to have Cutter figure it out for you. Any window whose
+  open file is inside the workspace directory (e.g. an Xcode project under
+  `~/cutter/<name>/`) is linked automatically, and a headless Claude session
+  (the same one behind `--ai`, riding your subscription) picks additional windows
+  related by name or title — a browser tab about the ticket, a design doc, etc.
+  Matches are added to any existing links; unlink wrong guesses with the ✕.
 - **Click the workspace** to raise its linked windows to the foreground. If a
   linked window lives on another Space, Cutter **switches to that Space** first
   (so clicking a workspace from Space 2 jumps you to Space 1 where its windows

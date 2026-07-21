@@ -1,5 +1,6 @@
 pub mod ai;
 pub mod base;
+pub mod claude;
 pub mod create;
 pub mod list;
 pub mod open;

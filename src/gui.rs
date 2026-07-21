@@ -8,6 +8,7 @@ use egui_term::{PtyEvent, TerminalBackend, TerminalView};
 use notify_debouncer_mini::notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_mini::{new_debouncer, DebounceEventResult, Debouncer};
 
+use crate::ai_link;
 use crate::cli::ClaudeMode;
 use crate::commands;
 use crate::config::{config_dir, expand_tilde, Base, Config, RepoRef};
@@ -199,6 +200,16 @@ struct JobOutcome {
 struct StatusMsg {
     ok: bool,
     text: String,
+}
+
+/// Intents collected while rendering a workspace's details pane, applied after
+/// the pane's borrow of `self` has ended.
+#[derive(Default)]
+struct DetailActions {
+    remove: Option<String>,
+    open_link: bool,
+    auto_link: bool,
+    unlink_idx: Option<usize>,
 }
 
 struct CutterApp {
@@ -779,12 +790,10 @@ impl CutterApp {
     fn workspaces_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let job_active = self.job.is_some();
-        let mut want_remove_ws: Option<String> = None;
         // A workspace item was clicked this frame → raise its windows.
         let mut raise_request: Option<String> = None;
         // Detail-pane intents for the selected workspace.
-        let mut open_link = false;
-        let mut unlink_idx: Option<usize> = None;
+        let mut actions = DetailActions::default();
         // Standalone-terminal intents, applied after the panels render.
         let mut new_scratch = false;
         let mut close_scratch: Option<u64> = None;
@@ -992,9 +1001,7 @@ impl CutterApp {
                             ws,
                             &self.sessions,
                             job_active,
-                            &mut want_remove_ws,
-                            &mut open_link,
-                            &mut unlink_idx,
+                            &mut actions,
                         ),
                         None => {
                             ui.centered_and_justified(|ui| {
@@ -1039,15 +1046,20 @@ impl CutterApp {
                 focus: true,
             });
         }
-        if let Some(name) = want_remove_ws {
+        if let Some(name) = actions.remove {
             self.confirm_remove = Some(RemoveTarget::Workspace(name));
         }
-        if open_link {
+        if actions.open_link {
             if let Some(Selection::Workspace(name)) = self.selected.clone() {
                 self.open_link_windows(name);
             }
         }
-        if let Some(idx) = unlink_idx {
+        if actions.auto_link {
+            if let Some(Selection::Workspace(name)) = self.selected.clone() {
+                self.start_ai_link(&ctx, name);
+            }
+        }
+        if let Some(idx) = actions.unlink_idx {
             if let Some(Selection::Workspace(name)) = self.selected.clone() {
                 self.unlink_window(&name, idx);
             }
@@ -1062,9 +1074,7 @@ impl CutterApp {
         ws: &WorkspaceConfig,
         sessions: &[SessionRecord],
         job_active: bool,
-        want_remove: &mut Option<String>,
-        open_link: &mut bool,
-        unlink_idx: &mut Option<usize>,
+        actions: &mut DetailActions,
     ) {
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.add_space(6.0);
@@ -1077,7 +1087,7 @@ impl CutterApp {
                         .on_hover_text("Remove worktrees, branches, and files")
                         .clicked()
                     {
-                        *want_remove = Some(ws.workspace.name.clone());
+                        actions.remove = Some(ws.workspace.name.clone());
                     }
                 });
             });
@@ -1159,10 +1169,19 @@ impl CutterApp {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
                         .button("⧉ Link windows…")
-                        .on_hover_text("Tie macOS windows to this workspace")
+                        .on_hover_text("Manually tie macOS windows to this workspace")
                         .clicked()
                     {
-                        *open_link = true;
+                        actions.open_link = true;
+                    }
+                    if ui
+                        .add_enabled(!job_active, egui::Button::new("🤖 Auto-link"))
+                        .on_hover_text(
+                            "Let Claude pick windows related to this workspace and link them",
+                        )
+                        .clicked()
+                    {
+                        actions.auto_link = true;
                     }
                 });
             });
@@ -1181,7 +1200,7 @@ impl CutterApp {
                     ui.add_space(2.0);
                     ui.horizontal(|ui| {
                         if ui.small_button("✕").on_hover_text("Unlink").clicked() {
-                            *unlink_idx = Some(i);
+                            actions.unlink_idx = Some(i);
                         }
                         ui.label(egui::RichText::new(link.app_name.as_str()).strong());
                         let title = if link.title.is_empty() {
@@ -1353,6 +1372,61 @@ impl CutterApp {
         if self.new_ws_ai_base.is_none() {
             self.new_ws_ai_base = first_base;
         }
+    }
+
+    /// Auto-link windows to `ws_name`: enumerate the live windows on the UI
+    /// thread, then off-thread ask Claude which relate to the workspace (its
+    /// directory matches are always included) and persist the result. Runs as a
+    /// background job so the (slow) Claude call doesn't block the UI.
+    fn start_ai_link(&mut self, ctx: &egui::Context, ws_name: String) {
+        if self.job.is_some() {
+            return;
+        }
+        // Enumerating other apps' windows needs Accessibility permission.
+        self.ax_trusted = window_manager::accessibility_trusted(false);
+        if !self.ax_trusted {
+            window_manager::accessibility_trusted(true);
+            window_manager::open_accessibility_settings();
+            self.status = Some(StatusMsg {
+                ok: false,
+                text: "Cutter needs Accessibility access to see windows. Grant it under \
+                       System Settings ▸ Privacy & Security ▸ Accessibility, then try again."
+                    .into(),
+            });
+            return;
+        }
+
+        let windows = window_manager::list_windows();
+        let Some(ws) = self.workspaces.iter().find(|w| w.workspace.name == ws_name) else {
+            return;
+        };
+        let existing = ws.linked_windows.clone();
+        let ws_ctx = ai_link::WsContext {
+            name: ws.workspace.name.clone(),
+            path: ws.workspace.path.clone(),
+            repo_paths: ws
+                .repos
+                .iter()
+                .flat_map(|r| [r.worktree_path.clone(), r.source.clone()])
+                .collect(),
+        };
+
+        let label = format!("🤖 Auto-linking windows for '{ws_name}'…");
+        let name = ws_name;
+        self.start_job(ctx, label, move || {
+            let suggestion = ai_link::suggest(&ws_ctx, &windows, &existing);
+            let n = suggestion.links.len();
+            let mut ws = WorkspaceConfig::load(&name).map_err(|e| e.to_string())?;
+            ws.linked_windows = suggestion.links;
+            ws.save().map_err(|e| e.to_string())?;
+            if suggestion.claude_ok {
+                Ok(format!("Linked {n} window(s) to '{name}'"))
+            } else {
+                Ok(format!(
+                    "Linked {n} window(s) to '{name}' (Claude unavailable; matched by directory)"
+                ))
+            }
+        });
     }
 
     /// Open the "Link windows" modal for `ws_name`, snapshotting the live

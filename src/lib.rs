@@ -7,6 +7,9 @@ pub mod session;
 pub mod workspace;
 
 #[cfg(feature = "gui")]
+pub mod ai_link;
+
+#[cfg(feature = "gui")]
 pub mod gui;
 
 #[cfg(feature = "gui")]
