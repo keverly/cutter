@@ -12,6 +12,7 @@ use crate::ai_link;
 use crate::cli::ClaudeMode;
 use crate::commands;
 use crate::config::{config_dir, expand_tilde, Base, Config, RepoRef};
+use crate::git;
 use crate::pr;
 use crate::session::{self, SessionRecord, SessionState, WorkspaceStatus};
 use crate::window_manager::{self, WindowInfo};
@@ -26,6 +27,12 @@ const WAITING_COLOR: egui::Color32 = egui::Color32::from_rgb(0x3f, 0xb9, 0x50);
 /// a chat bubble with dots ("your turn to reply") for "waiting for input".
 const RUNNING_ICON: &str = egui_phosphor::regular::SPINNER_GAP;
 const WAITING_ICON: &str = egui_phosphor::regular::CHAT_CIRCLE_DOTS;
+
+/// Diff line colours: added green, removed red, hunk-header blue. Context and
+/// file headers use the default text colour (headers bolded).
+const DIFF_ADD_COLOR: egui::Color32 = egui::Color32::from_rgb(0x3f, 0xb9, 0x50);
+const DIFF_DEL_COLOR: egui::Color32 = egui::Color32::from_rgb(0xf8, 0x51, 0x49);
+const DIFF_HUNK_COLOR: egui::Color32 = egui::Color32::from_rgb(0x58, 0xa6, 0xff);
 
 /// PR-status chip colours: draft grey, open green, merged purple.
 const PR_DRAFT_COLOR: egui::Color32 = egui::Color32::from_rgb(0x8b, 0x94, 0x9e);
@@ -107,12 +114,95 @@ enum Tab {
 }
 
 /// Which pane the selected workspace shows: an embedded terminal (the default,
-/// so clicking a workspace lands on a live shell) or its details (repos, linked
-/// windows, remove).
+/// so clicking a workspace lands on a live shell), its details (repos, linked
+/// windows, remove), or a git diff of one of its repos.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkspaceView {
     Terminal,
     Details,
+    Diff,
+}
+
+/// How one line of a unified diff should be coloured. Classified once when a
+/// fetched diff arrives so per-frame rendering is just a table lookup.
+#[derive(Clone, Copy)]
+enum DiffLineKind {
+    /// `diff --git`, `+++`/`---`, `index`, `new file`, … — bolded default text.
+    FileHeader,
+    /// A `@@ … @@` hunk header.
+    Hunk,
+    /// An added line (`+`).
+    Add,
+    /// A removed line (`-`).
+    Del,
+    /// An unchanged context line.
+    Context,
+}
+
+/// A fetched, pre-classified diff ready to render: the ref it was diffed against
+/// (for the header) and its lines. Built on the UI thread from a [`git::RepoDiff`]
+/// so repaints don't re-split/re-classify a potentially large diff each frame.
+struct DiffView {
+    base_label: String,
+    lines: Vec<(DiffLineKind, String)>,
+}
+
+impl DiffView {
+    fn from_raw(raw: git::RepoDiff) -> Self {
+        let lines = raw
+            .text
+            .lines()
+            .map(|l| (classify_diff_line(l), l.to_string()))
+            .collect();
+        DiffView {
+            base_label: raw.base_label,
+            lines,
+        }
+    }
+}
+
+/// Classify a unified-diff line by its leading marker. Order matters: `+++`/`---`
+/// file headers must be caught before the single-char `+`/`-` add/remove tests.
+fn classify_diff_line(line: &str) -> DiffLineKind {
+    if line.starts_with("diff --git")
+        || line.starts_with("+++")
+        || line.starts_with("---")
+        || line.starts_with("index ")
+        || line.starts_with("new file")
+        || line.starts_with("deleted file")
+        || line.starts_with("rename ")
+        || line.starts_with("similarity ")
+        || line.starts_with("old mode")
+        || line.starts_with("new mode")
+        || line.starts_with("Binary files")
+    {
+        DiffLineKind::FileHeader
+    } else if line.starts_with("@@") {
+        DiffLineKind::Hunk
+    } else if line.starts_with('+') {
+        DiffLineKind::Add
+    } else if line.starts_with('-') {
+        DiffLineKind::Del
+    } else {
+        DiffLineKind::Context
+    }
+}
+
+/// Render one diff line as non-wrapping monospace text in its kind's colour.
+/// Long lines extend past the viewport (the pane scrolls horizontally) rather
+/// than wrapping, so alignment and hunk structure stay readable.
+fn diff_line_label(ui: &mut egui::Ui, kind: DiffLineKind, text: &str) {
+    // A blank line still needs to occupy a row so the diff's spacing is kept.
+    let shown = if text.is_empty() { " " } else { text };
+    let rt = egui::RichText::new(shown).monospace();
+    let rt = match kind {
+        DiffLineKind::Add => rt.color(DIFF_ADD_COLOR),
+        DiffLineKind::Del => rt.color(DIFF_DEL_COLOR),
+        DiffLineKind::Hunk => rt.color(DIFF_HUNK_COLOR),
+        DiffLineKind::FileHeader => rt.strong(),
+        DiffLineKind::Context => rt,
+    };
+    ui.add(egui::Label::new(rt).wrap_mode(egui::TextWrapMode::Extend));
 }
 
 /// One terminal tab within a workspace: a live PTY-backed terminal, its stable
@@ -244,6 +334,16 @@ struct CutterApp {
     pr_tx: Sender<(String, Vec<pr::PrInfo>)>,
     pr_rx: Receiver<(String, Vec<pr::PrInfo>)>,
 
+    // Git diffs, keyed by (workspace name, repo name) and fetched lazily
+    // off-thread. `diff_view_repo` remembers which repo the Diff pane shows per
+    // workspace; `diff_fetching` guards duplicate in-flight fetches; results
+    // (Ok(diff) or Err(message)) arrive on `diff_rx`.
+    diff_cache: HashMap<(String, String), std::result::Result<DiffView, String>>,
+    diff_view_repo: HashMap<String, usize>,
+    diff_fetching: HashSet<(String, String)>,
+    diff_tx: Sender<(String, String, std::result::Result<git::RepoDiff, String>)>,
+    diff_rx: Receiver<(String, String, std::result::Result<git::RepoDiff, String>)>,
+
     // Settings / config
     workspace_root: String,
     default_branch_from: String,
@@ -320,6 +420,7 @@ impl CutterApp {
     fn new(ctx: &egui::Context) -> Self {
         let (term_tx, term_rx) = std::sync::mpsc::channel();
         let (pr_tx, pr_rx) = std::sync::mpsc::channel();
+        let (diff_tx, diff_rx) = std::sync::mpsc::channel();
         let mut app = Self {
             tab: Tab::Workspaces,
             workspaces: Vec::new(),
@@ -331,6 +432,11 @@ impl CutterApp {
             pr_fetching: HashSet::new(),
             pr_tx,
             pr_rx,
+            diff_cache: HashMap::new(),
+            diff_view_repo: HashMap::new(),
+            diff_fetching: HashSet::new(),
+            diff_tx,
+            diff_rx,
             workspace_root: String::new(),
             default_branch_from: String::new(),
             bases: BTreeMap::new(),
@@ -1030,6 +1136,7 @@ impl CutterApp {
                     // status chip's text changes width. In a right-to-left layout
                     // the first widget lands rightmost, so add Details before Terminal.
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.selectable_value(&mut self.ws_view, WorkspaceView::Diff, "Diff");
                         ui.selectable_value(&mut self.ws_view, WorkspaceView::Details, "Details");
                         ui.selectable_value(&mut self.ws_view, WorkspaceView::Terminal, "Terminal");
                     });
@@ -1069,6 +1176,7 @@ impl CutterApp {
 
                 match self.ws_view {
                     WorkspaceView::Terminal => self.terminal_pane(ui, &name),
+                    WorkspaceView::Diff => self.diff_pane(ui, &name),
                     WorkspaceView::Details => match self.selected_workspace() {
                         Some(ws) => Self::workspace_details(
                             ui,
@@ -1453,6 +1561,165 @@ impl CutterApp {
 
     /// Fetch GitHub PR status for a workspace's repos off the UI thread (a `gh`
     /// call per repo), caching the result. No-op if already cached or in flight.
+    /// The Diff pane for `ws_name`: a repo dropdown + refresh above a coloured,
+    /// scrollable unified diff of the selected repo. Diffs are fetched lazily and
+    /// cached; switching repos or hitting Refresh triggers a fetch.
+    fn diff_pane(&mut self, ui: &mut egui::Ui, ws_name: &str) {
+        let ctx = ui.ctx().clone();
+
+        // The repos in this workspace (name + worktree path) and its base name.
+        let Some(ws) = self.workspaces.iter().find(|w| w.workspace.name == ws_name) else {
+            ui.centered_and_justified(|ui| {
+                ui.label(egui::RichText::new("Workspace not found").weak());
+            });
+            return;
+        };
+        let repos: Vec<(String, String)> = ws
+            .repos
+            .iter()
+            .map(|r| (r.name.clone(), r.worktree_path.clone()))
+            .collect();
+        let base_name = ws.workspace.base.clone();
+
+        if repos.is_empty() {
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("This workspace has no repos.").weak());
+            return;
+        }
+
+        // Which repo is shown, clamped in case the workspace's repos changed.
+        let mut sel = self
+            .diff_view_repo
+            .get(ws_name)
+            .copied()
+            .unwrap_or(0)
+            .min(repos.len() - 1);
+
+        // --- header: repo dropdown + refresh + "vs <base>" label ---
+        let mut refresh = false;
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt(("diff_repo", ws_name))
+                .selected_text(repos[sel].0.clone())
+                .show_ui(ui, |ui| {
+                    for (i, (name, _)) in repos.iter().enumerate() {
+                        ui.selectable_value(&mut sel, i, name);
+                    }
+                });
+            if ui
+                .button("⟳ Refresh")
+                .on_hover_text("Re-run git diff for this repo")
+                .clicked()
+            {
+                refresh = true;
+            }
+            let key = (ws_name.to_string(), repos[sel].0.clone());
+            if let Some(Ok(dv)) = self.diff_cache.get(&key) {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new(format!("vs {}", dv.base_label))
+                            .weak()
+                            .small(),
+                    )
+                    .on_hover_text(
+                        "Changes on this branch — committed and uncommitted — \
+                         since it forked from this ref.",
+                    );
+                });
+            }
+        });
+        self.diff_view_repo.insert(ws_name.to_string(), sel);
+
+        let (repo_name, worktree) = repos[sel].clone();
+        let key = (ws_name.to_string(), repo_name.clone());
+
+        if refresh {
+            self.diff_cache.remove(&key);
+        }
+
+        // Kick off a fetch if we have neither a cached result nor one in flight.
+        if !self.diff_cache.contains_key(&key) && !self.diff_fetching.contains(&key) {
+            let base_hint = self.base_ref_for(&base_name, &repo_name);
+            self.start_diff_fetch(&ctx, ws_name.to_string(), repo_name, worktree, base_hint);
+        }
+
+        ui.separator();
+
+        // --- body ---
+        match self.diff_cache.get(&key) {
+            Some(Ok(dv)) if dv.lines.is_empty() => {
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new("No changes.").weak());
+            }
+            Some(Ok(dv)) => {
+                // Virtualise on line count: only the visible rows are laid out,
+                // so even a huge diff stays cheap to repaint.
+                let row_h = ui.text_style_height(&egui::TextStyle::Monospace);
+                egui::ScrollArea::both()
+                    .auto_shrink([false, false])
+                    .show_rows(ui, row_h, dv.lines.len(), |ui, range| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        for i in range {
+                            let (kind, text) = &dv.lines[i];
+                            diff_line_label(ui, *kind, text);
+                        }
+                    });
+            }
+            Some(Err(e)) => {
+                ui.add_space(8.0);
+                ui.colored_label(egui::Color32::RED, e);
+            }
+            None => {
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(egui::RichText::new("Loading diff…").weak());
+                });
+            }
+        }
+    }
+
+    /// Fetch `repo_name`'s diff for `ws_name` on a worker thread, delivering the
+    /// result on `diff_rx`. `base_hint` is the ref the worktree forked from.
+    fn start_diff_fetch(
+        &mut self,
+        ctx: &egui::Context,
+        ws_name: String,
+        repo_name: String,
+        worktree: String,
+        base_hint: Option<String>,
+    ) {
+        let key = (ws_name.clone(), repo_name.clone());
+        if self.diff_fetching.contains(&key) {
+            return;
+        }
+        self.diff_fetching.insert(key);
+        let tx = self.diff_tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result = git::diff(std::path::Path::new(&worktree), base_hint.as_deref())
+                .map_err(|e| e.to_string());
+            let _ = tx.send((ws_name, repo_name, result));
+            ctx.request_repaint();
+        });
+    }
+
+    /// The ref the given repo's worktree was branched from, following the same
+    /// precedence as workspace creation: the repo's per-repo override, else the
+    /// base's override, else the global default. Returns `None` if the base is
+    /// no longer in the config (the diff then auto-detects a default branch).
+    fn base_ref_for(&self, base_name: &str, repo_name: &str) -> Option<String> {
+        let base = self.bases.get(base_name)?;
+        let per_repo = base
+            .repos
+            .iter()
+            .find(|r| r.name == repo_name)
+            .and_then(|r| r.branch_from.clone());
+        per_repo
+            .or_else(|| base.branch_from.clone())
+            .or_else(|| Some(self.default_branch_from.clone()))
+    }
+
     fn start_pr_fetch(&mut self, ctx: &egui::Context, ws_name: String) {
         if self.pr_fetching.contains(&ws_name) || self.pr_status.contains_key(&ws_name) {
             return;
@@ -2279,6 +2546,15 @@ impl eframe::App for CutterApp {
             self.pr_status.insert(name, prs);
         }
 
+        // Collect any finished diff fetches, classifying each into a DiffView
+        // (splitting/colour-tagging its lines once) before caching it.
+        while let Ok((ws, repo, result)) = self.diff_rx.try_recv() {
+            let key = (ws, repo);
+            self.diff_fetching.remove(&key);
+            self.diff_cache
+                .insert(key, result.map(DiffView::from_raw));
+        }
+
         // A finished background job: surface its outcome and re-read from disk.
         if let Some(rx) = &self.job_rx {
             if let Ok(outcome) = rx.try_recv() {
@@ -2309,9 +2585,11 @@ impl eframe::App for CutterApp {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("⟳ Refresh").clicked() {
                         do_refresh = true;
-                        // Drop cached PR status so the selected workspace refetches.
+                        // Drop cached PR status and diffs so the selected
+                        // workspace refetches both.
                         self.pr_status.clear();
                         self.pr_fetching.clear();
+                        self.diff_cache.clear();
                     }
                 });
             });
