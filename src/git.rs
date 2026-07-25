@@ -138,24 +138,51 @@ pub fn diff(worktree: &Path, base_hint: Option<&str>) -> Result<RepoDiff> {
         )
         .find(|r| rev_parse_commit(&wt, r).is_some());
 
-    if let Some(base) = base {
-        // Resolve the fork point ourselves (rather than `git diff --merge-base`,
-        // which needs git 2.30+) and diff it against the working tree.
-        if let Some(mb) = merge_base(&wt, &base) {
-            let text = run_diff(&wt, &[&mb])?;
-            return Ok(RepoDiff {
-                base_label: base,
-                text,
-            });
-        }
+    // Tracked changes since the fork point (committed + uncommitted). We resolve
+    // the merge base ourselves (rather than `git diff --merge-base`, which needs
+    // git 2.30+) for three-dot semantics; if `base` shares no history with HEAD
+    // we fall back to uncommitted-only (`git diff HEAD`).
+    let (base_label, mut text) = match base.as_deref().and_then(|b| merge_base(&wt, b)) {
+        Some(mb) => (base.unwrap(), run_diff(&wt, &[&mb])?),
+        None => ("HEAD".to_string(), run_diff(&wt, &["HEAD"])?),
+    };
+
+    // Untracked (new, never-added) files are omitted by `git diff`; append them
+    // so the view shows the complete set of changes.
+    text.push_str(&untracked_diff(&wt));
+
+    Ok(RepoDiff { base_label, text })
+}
+
+/// Diffs for untracked (new, never-added) files, which plain `git diff` omits.
+/// Each is rendered as an all-added file via `git diff --no-index`, whose output
+/// matches the tracked diff's format so the two concatenate seamlessly.
+/// Best-effort: `.gitignore`d files are excluded, and any file we can't diff is
+/// silently skipped.
+fn untracked_diff(wt: &str) -> String {
+    let listing = Command::new("git")
+        .args(["-C", wt, "ls-files", "--others", "--exclude-standard", "-z"])
+        .output();
+    let Ok(listing) = listing else {
+        return String::new();
+    };
+    if !listing.status.success() {
+        return String::new();
     }
 
-    // No shared history to compare against: show only uncommitted work.
-    let text = run_diff(&wt, &["HEAD"])?;
-    Ok(RepoDiff {
-        base_label: "HEAD".to_string(),
-        text,
-    })
+    let stdout = String::from_utf8_lossy(&listing.stdout);
+    let mut out = String::new();
+    for path in stdout.split('\0').filter(|p| !p.is_empty()) {
+        // `--no-index` exits 1 when the files differ (always, for a new file):
+        // that's not an error, so we take stdout regardless of the status code.
+        if let Ok(o) = Command::new("git")
+            .args(["-C", wt, "diff", "--no-index", "--", "/dev/null", path])
+            .output()
+        {
+            out.push_str(&String::from_utf8_lossy(&o.stdout));
+        }
+    }
+    out
 }
 
 /// The commit `r` resolves to in `wt`, or `None` if the ref doesn't exist.

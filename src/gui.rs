@@ -140,23 +140,47 @@ enum DiffLineKind {
 }
 
 /// A fetched, pre-classified diff ready to render: the ref it was diffed against
-/// (for the header) and its lines. Built on the UI thread from a [`git::RepoDiff`]
-/// so repaints don't re-split/re-classify a potentially large diff each frame.
+/// (for the header), a change summary, and its lines. Built on the UI thread from
+/// a [`git::RepoDiff`] so repaints don't re-split/re-classify a potentially large
+/// diff each frame.
 struct DiffView {
     base_label: String,
     lines: Vec<(DiffLineKind, String)>,
+    /// Summary counts for the header: files touched, lines added, lines removed.
+    files: usize,
+    additions: usize,
+    deletions: usize,
 }
 
 impl DiffView {
     fn from_raw(raw: git::RepoDiff) -> Self {
-        let lines = raw
+        let lines: Vec<(DiffLineKind, String)> = raw
             .text
             .lines()
             .map(|l| (classify_diff_line(l), l.to_string()))
             .collect();
+
+        // Tally the summary from the classified lines: one file per `diff --git`
+        // header, and add/remove counts (the `+++`/`---` file headers classify as
+        // FileHeader, so they're never miscounted here).
+        let mut files = 0;
+        let mut additions = 0;
+        let mut deletions = 0;
+        for (kind, text) in &lines {
+            match kind {
+                DiffLineKind::Add => additions += 1,
+                DiffLineKind::Del => deletions += 1,
+                DiffLineKind::FileHeader if text.starts_with("diff --git") => files += 1,
+                _ => {}
+            }
+        }
+
         DiffView {
             base_label: raw.base_label,
             lines,
+            files,
+            additions,
+            deletions,
         }
     }
 }
@@ -188,10 +212,37 @@ fn classify_diff_line(line: &str) -> DiffLineKind {
     }
 }
 
-/// Render one diff line as non-wrapping monospace text in its kind's colour.
-/// Long lines extend past the viewport (the pane scrolls horizontally) rather
-/// than wrapping, so alignment and hunk structure stay readable.
-fn diff_line_label(ui: &mut egui::Ui, kind: DiffLineKind, text: &str) {
+/// The full-row background tint for a diff line, or `None` for context lines.
+/// Kept faint (low alpha) so the coloured foreground text stays readable and the
+/// tint reads the same over light or dark panels.
+fn diff_line_bg(kind: DiffLineKind) -> Option<egui::Color32> {
+    match kind {
+        DiffLineKind::Add => Some(egui::Color32::from_rgba_unmultiplied(0x3f, 0xb9, 0x50, 26)),
+        DiffLineKind::Del => Some(egui::Color32::from_rgba_unmultiplied(0xf8, 0x51, 0x49, 26)),
+        DiffLineKind::Hunk => Some(egui::Color32::from_rgba_unmultiplied(0x58, 0xa6, 0xff, 22)),
+        // A neutral band behind each file's header block visually separates files.
+        DiffLineKind::FileHeader => {
+            Some(egui::Color32::from_rgba_unmultiplied(0x88, 0x88, 0x88, 22))
+        }
+        DiffLineKind::Context => None,
+    }
+}
+
+/// Render one diff line: a full-width background tint (fixed to the viewport, so
+/// it stays put during horizontal scroll) with non-wrapping monospace text on
+/// top. Long lines extend past the viewport rather than wrapping, so alignment
+/// and hunk structure stay readable.
+fn diff_row(ui: &mut egui::Ui, kind: DiffLineKind, text: &str, row_h: f32) {
+    // Paint the row background first (behind the text) across the visible width.
+    if let Some(bg) = diff_line_bg(kind) {
+        let clip = ui.clip_rect();
+        let rect = egui::Rect::from_min_size(
+            egui::pos2(clip.left(), ui.cursor().top()),
+            egui::vec2(clip.width(), row_h),
+        );
+        ui.painter().rect_filled(rect, 0.0, bg);
+    }
+
     // A blank line still needs to occupy a row so the diff's spacing is kept.
     let shown = if text.is_empty() { " " } else { text };
     let rt = egui::RichText::new(shown).monospace();
@@ -1615,6 +1666,21 @@ impl CutterApp {
             }
             let key = (ws_name.to_string(), repos[sel].0.clone());
             if let Some(Ok(dv)) = self.diff_cache.get(&key) {
+                // Change summary: "N files  +A  −D". Skipped when there's nothing
+                // to show (the body prints "No changes." instead).
+                if !dv.lines.is_empty() {
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} file{}",
+                            dv.files,
+                            if dv.files == 1 { "" } else { "s" }
+                        ))
+                        .weak(),
+                    );
+                    ui.colored_label(DIFF_ADD_COLOR, format!("+{}", dv.additions));
+                    ui.colored_label(DIFF_DEL_COLOR, format!("−{}", dv.deletions));
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
                         egui::RichText::new(format!("vs {}", dv.base_label))
@@ -1661,7 +1727,7 @@ impl CutterApp {
                         ui.spacing_mut().item_spacing.y = 0.0;
                         for i in range {
                             let (kind, text) = &dv.lines[i];
-                            diff_line_label(ui, *kind, text);
+                            diff_row(ui, *kind, text, row_h);
                         }
                     });
             }
