@@ -16,4 +16,7 @@ pub mod gui;
 pub mod pr;
 
 #[cfg(feature = "gui")]
+pub mod term_input;
+
+#[cfg(feature = "gui")]
 pub mod window_manager;

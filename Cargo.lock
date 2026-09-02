@@ -991,6 +991,7 @@ name = "cutter"
 version = "0.1.0"
 dependencies = [
  "accessibility-sys",
+ "alacritty_terminal",
  "chrono",
  "clap",
  "colored",

@@ -25,6 +25,13 @@ rfd = { version = "0.15", optional = true }
 # published 0.1.0 targets an older egui; master tracks egui 0.34 to match eframe.
 egui_term = { git = "https://github.com/Harzu/egui_term", optional = true }
 
+# The VT engine behind egui_term. Depended on directly (pinned to the exact
+# version egui_term resolves to, so it's the same crate and not a second copy)
+# because src/term_input.rs fills in the terminal input handling egui_term
+# leaves out, and that needs the grid/selection/mode types the widget only
+# passes through: see the module docs there.
+alacritty_terminal = { version = "=0.25.1", optional = true }
+
 # Window linking (GUI, macOS only): enumerate and raise other apps' windows via
 # the Accessibility API, ordered front-to-back via the CoreGraphics window list.
 # These are macOS-only crates; the GUI itself is a macOS app, so the `gui`
@@ -40,6 +47,7 @@ egui-phosphor = { version = "0.12", optional = true }
 # Builds the standalone Cutter.app GUI (the `cutter-gui` binary).
 gui = [
     "dep:eframe",
+    "dep:alacritty_terminal",
     "dep:notify-debouncer-mini",
     "dep:rfd",
     "dep:egui_term",

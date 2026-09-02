@@ -82,7 +82,27 @@ pane has a **Terminal** / **Details** toggle at the top:
   windows, and the **🗑 Remove** action.
 
 The terminal is an [`egui_term`](https://github.com/Harzu/egui_term) widget
-(alacritty's VT engine over a PTY), rendered inline in the Cutter window.
+(alacritty's VT engine over a PTY), rendered inline in the Cutter window, with
+the mouse and clipboard handling a real terminal has:
+
+- **Select and copy.** Drag to select, double-click for a word, triple-click for
+  a line, then **⌘C**. Copied text keeps its line breaks (soft-wrapped lines are
+  joined back up, as they were never really two lines). While a full-screen
+  program is tracking the mouse — Claude Code does, on its alternate screen —
+  hold **⌥** (or **⇧**) while dragging to select locally instead of handing the
+  drag to the program.
+- **Paste.** **⌘V** pastes, fenced as a bracketed paste when the program asked
+  for one, so a multi-line paste doesn't run every line but the last.
+- **Drag and drop files.** Drop a file — an image, say — anywhere on the
+  terminal and its path is pasted, quoted if it needs it. That's the gesture
+  behind handing an image to Claude Code, which reads it from the path.
+  Something dragged straight out of a browser, with bytes but no file behind it,
+  is written to a temp file first so there's a path to hand over.
+- **Scroll.** The wheel walks back through the scrollback, or is handed to a
+  program that's tracking the mouse so it scrolls its own content — without
+  that, scrolling a Claude Code session moved through its prompt history rather
+  than the transcript. Hold **⌥** to scroll this terminal's own scrollback
+  anyway.
 
 > The GUI reads and writes the same `~/.config/cutter` data the CLI uses. To run
 > it without bundling, use `cargo run --features gui --bin cutter-gui`.
