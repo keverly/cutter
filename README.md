@@ -117,6 +117,15 @@ close it with the **✖** in the list, the **✖ Close** button in the pane, or 
 exiting the shell. **Double-click** an entry to rename it. These are ephemeral —
 they aren't saved across restarts.
 
+### Collapsed view
+
+The **caret** at the top left collapses the window to just the workspace list —
+no terminal, no details — and narrows the window to fit it. That's Cutter as a
+launcher: which workspaces exist, what Claude is doing in each, and one click to
+bring a workspace's linked windows forward, in a strip you can park beside
+whatever you're actually working in. The caret puts the window back the size it
+was. Terminals keep running while collapsed; they're only hidden.
+
 ### Linking macOS windows to a workspace
 
 You can tie real macOS windows to a workspace and bring them forward with one

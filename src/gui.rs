@@ -35,6 +35,13 @@ const DIFF_ADD_COLOR: egui::Color32 = egui::Color32::from_rgb(0x3f, 0xb9, 0x50);
 const DIFF_DEL_COLOR: egui::Color32 = egui::Color32::from_rgb(0xf8, 0x51, 0x49);
 const DIFF_HUNK_COLOR: egui::Color32 = egui::Color32::from_rgb(0x58, 0xa6, 0xff);
 
+/// Icons for the collapse toggle: point the carets the way the window moves.
+const COLLAPSE_ICON: &str = egui_phosphor::regular::CARET_DOUBLE_LEFT;
+const EXPAND_ICON: &str = egui_phosphor::regular::CARET_DOUBLE_RIGHT;
+
+/// Window width, in points, of the collapsed list-only view.
+const COLLAPSED_WIDTH: f32 = 300.0;
+
 /// PR-status chip colours: draft grey, open green, merged purple.
 const PR_DRAFT_COLOR: egui::Color32 = egui::Color32::from_rgb(0x8b, 0x94, 0x9e);
 const PR_OPEN_COLOR: egui::Color32 = egui::Color32::from_rgb(0x3f, 0xb9, 0x50);
@@ -56,7 +63,10 @@ pub fn run() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_title("Cutter")
             .with_inner_size([820.0, 560.0])
-            .with_min_inner_size([560.0, 360.0]),
+            // Low enough to let the collapsed list-only view shrink to
+            // `COLLAPSED_WIDTH`; the expanded view is never this small in
+            // practice, and nothing breaks if the user drags it there.
+            .with_min_inner_size([260.0, 320.0]),
         ..Default::default()
     };
 
@@ -325,6 +335,24 @@ enum NewWsMode {
     Manual,
 }
 
+/// Intents collected while the workspace list renders, applied once the panel
+/// closure's borrow of `self` has ended.
+#[derive(Default)]
+struct ListActions {
+    /// A workspace was clicked → raise its linked windows.
+    raise: Option<String>,
+    /// Open a new standalone terminal.
+    new_scratch: bool,
+    /// Close the standalone terminal with this PTY id.
+    close_scratch: Option<u64>,
+    /// Start renaming a standalone terminal, seeded with its current name.
+    start_rename: Option<(u64, String)>,
+    /// Commit the in-progress rename of this standalone terminal.
+    commit_rename: Option<u64>,
+    /// Abandon the in-progress rename.
+    cancel_rename: bool,
+}
+
 /// A user intent collected during a UI pass, applied after rendering so the
 /// borrow of `self` from the panel/window closures has ended.
 enum PendingAction {
@@ -462,6 +490,11 @@ struct CutterApp {
     next_scratch_num: u32,
     // In-progress inline rename of a terminal, if any (see `Renaming`).
     renaming: Option<Renaming>,
+
+    // Collapsed view: just the workspace list, in a window narrowed to fit it.
+    // `expanded_size` remembers the window to restore on the way back out.
+    collapsed: bool,
+    expanded_size: Option<egui::Vec2>,
     term_tx: Sender<(u64, PtyEvent)>,
     term_rx: Receiver<(u64, PtyEvent)>,
     next_term_id: u64,
@@ -525,6 +558,8 @@ impl CutterApp {
             scratch_terminals: Vec::new(),
             next_scratch_num: 1,
             renaming: None,
+            collapsed: false,
+            expanded_size: None,
             term_tx,
             term_rx,
             next_term_id: 0,
@@ -981,281 +1016,322 @@ impl CutterApp {
         }
     }
 
-    fn workspaces_ui(&mut self, ui: &mut egui::Ui) {
-        let ctx = ui.ctx().clone();
+    /// Collapse to just the workspace list, or restore the full view.
+    ///
+    /// Collapsed, Cutter is a launcher: the list of workspaces and their Claude
+    /// status, narrow enough to sit beside whatever you're actually working in.
+    /// The window follows, giving up the width the details pane was using and
+    /// getting it back on the way out. Terminals keep running either way —
+    /// they're only hidden, not closed.
+    fn toggle_collapsed(&mut self, ctx: &egui::Context) {
+        let current = ctx.input(|i| i.viewport().inner_rect).map(|r| r.size());
+        self.collapsed = !self.collapsed;
+        if self.collapsed {
+            // Settings is a form; it has nothing to say at list width.
+            self.tab = Tab::Workspaces;
+            self.expanded_size = current;
+            let height = current.map_or(560.0, |s| s.y);
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+                COLLAPSED_WIDTH,
+                height,
+            )));
+        } else if let Some(size) = self.expanded_size.take() {
+            // Keep whatever height the user settled on while collapsed.
+            let size = egui::vec2(size.x, current.map_or(size.y, |s| s.y));
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+        }
+    }
+
+    /// Render the left-hand list: every workspace, then the standalone
+    /// terminals. Collected intents go into `out` because the list is drawn
+    /// from inside a panel closure that borrows `self`.
+    ///
+    /// This is the whole window when the view is collapsed, so it has to stand
+    /// on its own rather than assume a details pane beside it.
+    fn workspace_list(&mut self, ui: &mut egui::Ui, out: &mut ListActions) {
         let job_active = self.job.is_some();
-        // A workspace item was clicked this frame → raise its windows.
-        let mut raise_request: Option<String> = None;
-        // Detail-pane intents for the selected workspace.
-        let mut actions = DetailActions::default();
-        // Standalone-terminal intents, applied after the panels render.
-        let mut new_scratch = false;
-        let mut close_scratch: Option<u64> = None;
-        let mut start_scratch_rename: Option<(u64, String)> = None;
-        let mut commit_scratch_rename: Option<u64> = None;
-        let mut cancel_scratch_rename = false;
-        // A workspace whose PR status needs fetching (lazy, once per workspace).
-        let mut pr_fetch_request: Option<String> = None;
-
-        egui::Panel::left("workspace_list")
-            .resizable(true)
-            .default_size(220.0)
-            .show_inside(ui, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    // --- Workspaces ---
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(format!("Workspaces ({})", self.workspaces.len()))
-                                .strong(),
-                        );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui
-                                .add_enabled(!job_active, egui::Button::new("➕ New"))
-                                .on_hover_text("Create a workspace")
-                                .clicked()
-                            {
-                                self.open_new_workspace();
-                            }
-                        });
-                    });
-                    ui.separator();
-
-                    if let Some(err) = &self.workspaces_error {
-                        ui.colored_label(egui::Color32::RED, err);
-                    } else if self.workspaces.is_empty() {
-                        ui.add_space(4.0);
-                        ui.label(egui::RichText::new("No workspaces yet. Use ➕ New.").weak());
-                    } else {
-                        // Snapshot names first so we can mutate `selected` while iterating.
-                        let names: Vec<String> =
-                            self.workspaces.iter().map(|w| w.workspace.name.clone()).collect();
-                        for name in names {
-                            let is_selected = matches!(
-                                &self.selected,
-                                Some(Selection::Workspace(n)) if n == &name
-                            );
-                            // Show a small ⧉ marker on workspaces that have links.
-                            let has_links = self
-                                .workspaces
-                                .iter()
-                                .find(|w| w.workspace.name == name)
-                                .is_some_and(|w| !w.linked_windows.is_empty());
-                            let label = if has_links {
-                                format!("⧉  {name}")
-                            } else {
-                                name.clone()
-                            };
-                            let status =
-                                self.session_status.get(&name).copied().unwrap_or_default();
-                            let clicked = ui
-                                .horizontal(|ui| {
-                                    // A leading icon shows Claude's status in a
-                                    // fixed-width slot so names stay aligned; idle
-                                    // workspaces leave the slot empty.
-                                    let slot = egui::vec2(18.0, 16.0);
-                                    match status.state() {
-                                        Some(state) => {
-                                            let (icon, color) = state_icon(state);
-                                            ui.add_sized(
-                                                slot,
-                                                egui::Label::new(
-                                                    egui::RichText::new(icon).color(color),
-                                                ),
-                                            )
-                                            .on_hover_text(status_hover(state, status));
-                                        }
-                                        None => {
-                                            ui.add_sized(slot, egui::Label::new(""));
-                                        }
-                                    }
-                                    ui.selectable_label(is_selected, label).clicked()
-                                })
-                                .inner;
-                            if clicked {
-                                self.selected = Some(Selection::Workspace(name.clone()));
-                                // Clicking activates the workspace's linked windows.
-                                raise_request = Some(name);
-                            }
-                        }
-                    }
-
-                    // --- Standalone terminals ---
-                    ui.add_space(14.0);
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "Terminals ({})",
-                                self.scratch_terminals.len()
-                            ))
-                            .strong(),
-                        );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui
-                                .button("➕ New")
-                                .on_hover_text("Open a standalone terminal (not tied to a workspace)")
-                                .clicked()
-                            {
-                                new_scratch = true;
-                            }
-                        });
-                    });
-                    ui.separator();
-
-                    if self.scratch_terminals.is_empty() {
-                        ui.add_space(4.0);
-                        ui.label(
-                            egui::RichText::new("A plain shell rooted at your home directory.")
-                                .weak(),
-                        );
-                    } else {
-                        // Snapshot ids/names so we can mutate `selected` while iterating.
-                        let entries: Vec<(u64, String)> = self
-                            .scratch_terminals
-                            .iter()
-                            .map(|s| (s.tab.id, s.name.clone()))
-                            .collect();
-                        for (id, tname) in entries {
-                            let is_selected = self.selected == Some(Selection::Scratch(id));
-                            let editing = self.renaming.as_ref().is_some_and(|r| r.id == id);
-                            let clicked = ui
-                                .horizontal(|ui| {
-                                    if ui
-                                        .small_button("✖")
-                                        .on_hover_text("Close terminal")
-                                        .clicked()
-                                    {
-                                        close_scratch = Some(id);
-                                    }
-                                    if editing {
-                                        match rename_field(
-                                            ui,
-                                            self.renaming.as_mut().unwrap(),
-                                            130.0,
-                                        ) {
-                                            Some(true) => commit_scratch_rename = Some(id),
-                                            Some(false) => cancel_scratch_rename = true,
-                                            None => {}
-                                        }
-                                        false
-                                    } else {
-                                        let resp = ui
-                                            .selectable_label(is_selected, tname.clone())
-                                            .on_hover_text("Double-click to rename");
-                                        if resp.double_clicked() {
-                                            start_scratch_rename = Some((id, tname.clone()));
-                                        }
-                                        resp.clicked()
-                                    }
-                                })
-                                .inner;
-                            if clicked {
-                                self.selected = Some(Selection::Scratch(id));
-                            }
-                        }
+        // A fixed id keeps the scroll position across a collapse/expand, which
+        // reparents the list from the side panel to the central one.
+        let scroll = egui::ScrollArea::vertical().id_salt("workspace_list_scroll");
+        scroll.show(ui, |ui| {
+            // --- Workspaces ---
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("Workspaces ({})", self.workspaces.len()))
+                        .strong(),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add_enabled(!job_active, egui::Button::new("➕ New"))
+                        .on_hover_text("Create a workspace")
+                        .clicked()
+                    {
+                        self.open_new_workspace();
                     }
                 });
             });
+            ui.separator();
 
-        egui::CentralPanel::default().show_inside(ui, |ui| match self.selected.clone() {
-            Some(Selection::Workspace(name)) => {
-                // Header: workspace name + Claude status chip + Terminal/Details toggle.
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.heading(&name);
-                    if let Some(state) = self.session_status.get(&name).and_then(|s| s.state()) {
-                        match state {
-                            SessionState::Running => {
-                                // A live spinner reads as activity; the Spinner
-                                // widget requests its own repaints while visible.
-                                ui.add(egui::Spinner::new().size(15.0).color(RUNNING_COLOR));
-                                ui.colored_label(RUNNING_COLOR, "running");
+            if let Some(err) = &self.workspaces_error {
+                ui.colored_label(egui::Color32::RED, err);
+            } else if self.workspaces.is_empty() {
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("No workspaces yet. Use ➕ New.").weak());
+            } else {
+                // Snapshot names first so we can mutate `selected` while iterating.
+                let names: Vec<String> =
+                    self.workspaces.iter().map(|w| w.workspace.name.clone()).collect();
+                for name in names {
+                    let is_selected = matches!(
+                        &self.selected,
+                        Some(Selection::Workspace(n)) if n == &name
+                    );
+                    // Show a small ⧉ marker on workspaces that have links.
+                    let has_links = self
+                        .workspaces
+                        .iter()
+                        .find(|w| w.workspace.name == name)
+                        .is_some_and(|w| !w.linked_windows.is_empty());
+                    let label = if has_links {
+                        format!("⧉  {name}")
+                    } else {
+                        name.clone()
+                    };
+                    let status =
+                        self.session_status.get(&name).copied().unwrap_or_default();
+                    let clicked = ui
+                        .horizontal(|ui| {
+                            // A leading icon shows Claude's status in a
+                            // fixed-width slot so names stay aligned; idle
+                            // workspaces leave the slot empty.
+                            let slot = egui::vec2(18.0, 16.0);
+                            match status.state() {
+                                Some(state) => {
+                                    let (icon, color) = state_icon(state);
+                                    ui.add_sized(
+                                        slot,
+                                        egui::Label::new(
+                                            egui::RichText::new(icon).color(color),
+                                        ),
+                                    )
+                                    .on_hover_text(status_hover(state, status));
+                                }
+                                None => {
+                                    ui.add_sized(slot, egui::Label::new(""));
+                                }
                             }
-                            SessionState::Waiting => {
-                                ui.colored_label(
-                                    WAITING_COLOR,
-                                    format!("{WAITING_ICON} waiting for input"),
-                                );
-                            }
-                        }
+                            ui.selectable_label(is_selected, label).clicked()
+                        })
+                        .inner;
+                    if clicked {
+                        self.selected = Some(Selection::Workspace(name.clone()));
+                        // Clicking activates the workspace's linked windows.
+                        out.raise = Some(name);
                     }
-                    // Anchor the view toggle to the right so it stays put as the
-                    // status chip's text changes width. In a right-to-left layout
-                    // the first widget lands rightmost, so add Details before Terminal.
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.selectable_value(&mut self.ws_view, WorkspaceView::Diff, "Diff");
-                        ui.selectable_value(&mut self.ws_view, WorkspaceView::Details, "Details");
-                        ui.selectable_value(&mut self.ws_view, WorkspaceView::Terminal, "Terminal");
-                    });
-                });
-
-                // PR chips under the workspace name (one per in-flight PR across
-                // the repos), coloured by status and linking to GitHub. Fetched
-                // lazily the first time the workspace is shown.
-                match self.pr_status.get(&name) {
-                    Some(prs) if !prs.is_empty() => {
-                        ui.horizontal(|ui| {
-                            for p in prs {
-                                ui.hyperlink_to(
-                                    egui::RichText::new(format!("#{}", p.number))
-                                        .color(pr_color(p.state))
-                                        .strong(),
-                                    &p.url,
-                                )
-                                .on_hover_text(format!(
-                                    "{} · {} ({})",
-                                    p.repo,
-                                    p.title,
-                                    p.state.label()
-                                ));
-                            }
-                        });
-                    }
-                    Some(_) => {} // fetched, none in flight → show nothing
-                    None => {
-                        if !self.pr_fetching.contains(&name) {
-                            pr_fetch_request = Some(name.clone());
-                        }
-                    }
-                }
-
-                ui.separator();
-
-                match self.ws_view {
-                    WorkspaceView::Terminal => self.terminal_pane(ui, &name),
-                    WorkspaceView::Diff => self.diff_pane(ui, &name),
-                    WorkspaceView::Details => match self.selected_workspace() {
-                        Some(ws) => Self::workspace_details(
-                            ui,
-                            ws,
-                            &self.sessions,
-                            job_active,
-                            &mut actions,
-                        ),
-                        None => {
-                            ui.centered_and_justified(|ui| {
-                                ui.label(egui::RichText::new("Select a workspace").weak());
-                            });
-                        }
-                    },
                 }
             }
-            Some(Selection::Scratch(id)) => self.scratch_terminal_pane(ui, id),
-            None => {
-                ui.centered_and_justified(|ui| {
-                    ui.label(egui::RichText::new("Select a workspace or terminal").weak());
+
+            // --- Standalone terminals ---
+            ui.add_space(14.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Terminals ({})",
+                        self.scratch_terminals.len()
+                    ))
+                    .strong(),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .button("➕ New")
+                        .on_hover_text("Open a standalone terminal (not tied to a workspace)")
+                        .clicked()
+                    {
+                        out.new_scratch = true;
+                    }
                 });
+            });
+            ui.separator();
+
+            if self.scratch_terminals.is_empty() {
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new("A plain shell rooted at your home directory.")
+                        .weak(),
+                );
+            } else {
+                // Snapshot ids/names so we can mutate `selected` while iterating.
+                let entries: Vec<(u64, String)> = self
+                    .scratch_terminals
+                    .iter()
+                    .map(|s| (s.tab.id, s.name.clone()))
+                    .collect();
+                for (id, tname) in entries {
+                    let is_selected = self.selected == Some(Selection::Scratch(id));
+                    let editing = self.renaming.as_ref().is_some_and(|r| r.id == id);
+                    let clicked = ui
+                        .horizontal(|ui| {
+                            if ui
+                                .small_button("✖")
+                                .on_hover_text("Close terminal")
+                                .clicked()
+                            {
+                                out.close_scratch = Some(id);
+                            }
+                            if editing {
+                                match rename_field(
+                                    ui,
+                                    self.renaming.as_mut().unwrap(),
+                                    130.0,
+                                ) {
+                                    Some(true) => out.commit_rename = Some(id),
+                                    Some(false) => out.cancel_rename = true,
+                                    None => {}
+                                }
+                                false
+                            } else {
+                                let resp = ui
+                                    .selectable_label(is_selected, tname.clone())
+                                    .on_hover_text("Double-click to rename");
+                                if resp.double_clicked() {
+                                    out.start_rename = Some((id, tname.clone()));
+                                }
+                                resp.clicked()
+                            }
+                        })
+                        .inner;
+                    if clicked {
+                        self.selected = Some(Selection::Scratch(id));
+                    }
+                }
             }
         });
+    }
 
-        if new_scratch {
+    fn workspaces_ui(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let job_active = self.job.is_some();
+        // List intents (selection, standalone terminals), applied after the
+        // panels render and their borrows of `self` have ended.
+        let mut list = ListActions::default();
+        // Detail-pane intents for the selected workspace.
+        let mut actions = DetailActions::default();
+        // A workspace whose PR status needs fetching (lazy, once per workspace).
+        let mut pr_fetch_request: Option<String> = None;
+
+        // Collapsed, the list is the whole window; expanded, it's the left
+        // panel with the selected workspace's pane beside it.
+        if self.collapsed {
+            egui::CentralPanel::default().show_inside(ui, |ui| self.workspace_list(ui, &mut list));
+        } else {
+            egui::Panel::left("workspace_list")
+                .resizable(true)
+                .default_size(220.0)
+                .show_inside(ui, |ui| self.workspace_list(ui, &mut list));
+
+            egui::CentralPanel::default().show_inside(ui, |ui| match self.selected.clone() {
+                Some(Selection::Workspace(name)) => {
+                    // Header: workspace name + Claude status chip + Terminal/Details toggle.
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.heading(&name);
+                        let state = self.session_status.get(&name).and_then(|s| s.state());
+                        if let Some(state) = state {
+                            match state {
+                                SessionState::Running => {
+                                    // A live spinner reads as activity; the Spinner
+                                    // widget requests its own repaints while visible.
+                                    ui.add(egui::Spinner::new().size(15.0).color(RUNNING_COLOR));
+                                    ui.colored_label(RUNNING_COLOR, "running");
+                                }
+                                SessionState::Waiting => {
+                                    ui.colored_label(
+                                        WAITING_COLOR,
+                                        format!("{WAITING_ICON} waiting for input"),
+                                    );
+                                }
+                            }
+                        }
+                        // Anchor the view toggle to the right so it stays put as the
+                        // status chip's text changes width. In a right-to-left layout
+                        // the first widget lands rightmost, so add Details before Terminal.
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let view = &mut self.ws_view;
+                            ui.selectable_value(view, WorkspaceView::Diff, "Diff");
+                            ui.selectable_value(view, WorkspaceView::Details, "Details");
+                            ui.selectable_value(view, WorkspaceView::Terminal, "Terminal");
+                        });
+                    });
+
+                    // PR chips under the workspace name (one per in-flight PR across
+                    // the repos), coloured by status and linking to GitHub. Fetched
+                    // lazily the first time the workspace is shown.
+                    match self.pr_status.get(&name) {
+                        Some(prs) if !prs.is_empty() => {
+                            ui.horizontal(|ui| {
+                                for p in prs {
+                                    ui.hyperlink_to(
+                                        egui::RichText::new(format!("#{}", p.number))
+                                            .color(pr_color(p.state))
+                                            .strong(),
+                                        &p.url,
+                                    )
+                                    .on_hover_text(format!(
+                                        "{} · {} ({})",
+                                        p.repo,
+                                        p.title,
+                                        p.state.label()
+                                    ));
+                                }
+                            });
+                        }
+                        Some(_) => {} // fetched, none in flight → show nothing
+                        None => {
+                            if !self.pr_fetching.contains(&name) {
+                                pr_fetch_request = Some(name.clone());
+                            }
+                        }
+                    }
+
+                    ui.separator();
+
+                    match self.ws_view {
+                        WorkspaceView::Terminal => self.terminal_pane(ui, &name),
+                        WorkspaceView::Diff => self.diff_pane(ui, &name),
+                        WorkspaceView::Details => match self.selected_workspace() {
+                            Some(ws) => Self::workspace_details(
+                                ui,
+                                ws,
+                                &self.sessions,
+                                job_active,
+                                &mut actions,
+                            ),
+                            None => {
+                                ui.centered_and_justified(|ui| {
+                                    ui.label(egui::RichText::new("Select a workspace").weak());
+                                });
+                            }
+                        },
+                    }
+                }
+                Some(Selection::Scratch(id)) => self.scratch_terminal_pane(ui, id),
+                None => {
+                    ui.centered_and_justified(|ui| {
+                        ui.label(egui::RichText::new("Select a workspace or terminal").weak());
+                    });
+                }
+            });
+        }
+
+        if list.new_scratch {
             self.new_scratch_terminal(&ctx);
         }
-        if let Some(id) = close_scratch {
+        if let Some(id) = list.close_scratch {
             self.remove_term_by_id(id);
         }
         // Standalone-terminal rename: commit/cancel first, then start a new one.
-        if let Some(id) = commit_scratch_rename {
+        if let Some(id) = list.commit_rename {
             if let Some(r) = self.renaming.take() {
                 if let Some(s) = self.scratch_terminals.iter_mut().find(|s| s.tab.id == id) {
                     let n = r.buffer.trim();
@@ -1265,10 +1341,10 @@ impl CutterApp {
                 }
             }
         }
-        if cancel_scratch_rename {
+        if list.cancel_rename {
             self.renaming = None;
         }
-        if let Some((id, current)) = start_scratch_rename {
+        if let Some((id, current)) = list.start_rename {
             self.renaming = Some(Renaming {
                 id,
                 buffer: current,
@@ -1296,7 +1372,7 @@ impl CutterApp {
                 self.unlink_window(&name, idx);
             }
         }
-        if let Some(name) = raise_request {
+        if let Some(name) = list.raise {
             self.activate_workspace(&name);
         }
     }
@@ -2637,15 +2713,29 @@ impl eframe::App for CutterApp {
             }
         }
 
+        let mut toggle_collapsed = false;
         egui::Panel::top("tabs").show_inside(ui, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.heading("Cutter");
-                ui.separator();
-                ui.selectable_value(&mut self.tab, Tab::Workspaces, "Workspaces");
-                ui.selectable_value(&mut self.tab, Tab::Settings, "Settings");
+                let (icon, hint) = if self.collapsed {
+                    (EXPAND_ICON, "Show the terminal and details pane")
+                } else {
+                    (COLLAPSE_ICON, "Collapse to just the workspace list")
+                };
+                if ui.button(icon).on_hover_text(hint).clicked() {
+                    toggle_collapsed = true;
+                }
+                // At list width there's no room for the title and tabs, and
+                // nothing to switch to: the collapsed view is the list.
+                if !self.collapsed {
+                    ui.heading("Cutter");
+                    ui.separator();
+                    ui.selectable_value(&mut self.tab, Tab::Workspaces, "Workspaces");
+                    ui.selectable_value(&mut self.tab, Tab::Settings, "Settings");
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("⟳ Refresh").clicked() {
+                    let refresh = if self.collapsed { "⟳" } else { "⟳ Refresh" };
+                    if ui.button(refresh).on_hover_text("Reload from disk").clicked() {
                         do_refresh = true;
                         // Drop cached PR status and diffs so the selected
                         // workspace refetches both.
@@ -2690,6 +2780,9 @@ impl eframe::App for CutterApp {
         }
         if dismiss {
             self.status = None;
+        }
+        if toggle_collapsed {
+            self.toggle_collapsed(&ctx);
         }
 
         // Reload once, after the top panel's Refresh button has had a chance to
