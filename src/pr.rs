@@ -29,6 +29,12 @@ impl PrState {
             PrState::Merged => "merged",
         }
     }
+
+    /// Whether the PR is still in flight. Drafts count: GitHub reports them as
+    /// OPEN, and the branch still has a pull request waiting on it.
+    pub fn is_open(self) -> bool {
+        matches!(self, PrState::Draft | PrState::Open)
+    }
 }
 
 /// One pull request for a repo in a workspace.
@@ -125,6 +131,13 @@ mod tests {
         assert_eq!(by_num[&3], PrState::Merged);
         assert!(!by_num.contains_key(&9));
         assert_eq!(prs[0].repo, "frontend");
+    }
+
+    #[test]
+    fn drafts_count_as_open_but_merged_does_not() {
+        assert!(PrState::Open.is_open());
+        assert!(PrState::Draft.is_open());
+        assert!(!PrState::Merged.is_open());
     }
 
     #[test]
