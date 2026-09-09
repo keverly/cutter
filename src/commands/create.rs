@@ -157,10 +157,14 @@ pub fn run(name: Option<&str>, base_name: Option<&str>, print: bool, claude_mode
                 );
             }
             Err(e) => {
-                // Rollback created worktrees
+                // Rollback created worktrees, and the branches created with
+                // them — `worktree remove` leaves the `-b` branch behind, so
+                // without this a failed create litters every source repo with
+                // a branch that blocks retrying under the same name.
                 eprintln!("{} Failed to create worktree for '{}': {}", "✗".red(), repo.name, e);
                 for (src, tgt) in &created_worktrees {
                     let _ = git::worktree_remove(src, tgt, true);
+                    let _ = git::delete_branch(src, &name, true);
                 }
                 let _ = std::fs::remove_dir_all(&workspace_dir);
                 return Err(e);

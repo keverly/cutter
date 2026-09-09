@@ -28,10 +28,20 @@ pub fn fetch(source: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Create a worktree for `branch`, checked out from `start_point`.
+///
+/// Hooks are disabled for this one command (`core.hooksPath=/dev/null`): a
+/// fresh worktree has no `node_modules`, so a repo whose `post-checkout` hook
+/// shells out to its package manager (husky + yarn, say) fails the hook and
+/// makes `git worktree add` exit non-zero *after* the worktree is already on
+/// disk. The workspace's own init commands install dependencies afterwards, so
+/// there's nothing the hook would usefully do here anyway.
 pub fn worktree_add(source: &Path, target: &Path, branch: &str, start_point: Option<&str>) -> Result<()> {
     let mut args = vec![
         "-C".to_string(),
         source.to_string_lossy().to_string(),
+        "-c".to_string(),
+        "core.hooksPath=/dev/null".to_string(),
         "worktree".to_string(),
         "add".to_string(),
         target.to_string_lossy().to_string(),
@@ -81,13 +91,15 @@ pub fn worktree_remove(source: &Path, target: &Path, force: bool) -> Result<()> 
     Ok(())
 }
 
-pub fn delete_branch(source: &Path, branch: &str) -> Result<()> {
+/// Delete `branch`. `force` uses `-D`, which drops the branch even when its
+/// commits aren't merged anywhere.
+pub fn delete_branch(source: &Path, branch: &str, force: bool) -> Result<()> {
     let output = Command::new("git")
         .args([
             "-C",
             &source.to_string_lossy(),
             "branch",
-            "-d",
+            if force { "-D" } else { "-d" },
             branch,
         ])
         .output()?;

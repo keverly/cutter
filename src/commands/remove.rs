@@ -24,7 +24,7 @@ pub fn run(name: &str, keep_files: bool) -> Result<()> {
         }
 
         // Attempt to delete the branch
-        match git::delete_branch(&source, &repo.branch) {
+        match git::delete_branch(&source, &repo.branch, false) {
             Ok(()) => println!("  {} Deleted branch '{}' from {}", "✓".green(), repo.branch, repo.name),
             Err(_) => {
                 // Branch deletion is best-effort (may have unmerged changes)
