@@ -278,8 +278,9 @@ fn copy_base_files(
 /// - CLAUDE.md is *not* merged. Instead a workspace `.claude/CLAUDE.md` is
 ///   generated that points Claude at each project's own CLAUDE.md, keeping each
 ///   project's instructions authoritative and in place.
-/// - `skills/` and `agents/` are namespaced per project:
-///   `.claude/skills/<project>/…` and `.claude/agents/<project>/…`.
+/// - `skills/` are flattened into `.claude/skills/`, each renamed with its repo
+///   as a prefix (`<project>-<skill>`, matching the SKILL.md `name:`).
+/// - `agents/` are namespaced per project: `.claude/agents/<project>/…`.
 /// - settings.local.json (allow/deny) and mcp.json (servers) are merged.
 /// - Any other files are copied by relative path; conflicts across repos are
 ///   resolved by prefixing the filename with the repo name.
@@ -319,14 +320,17 @@ fn merge_claude_dirs(workspace_dir: &Path, worktrees: &[(PathBuf, PathBuf)], qui
             continue;
         }
 
-        // Namespace skills/ and agents/ under a per-project subdirectory so they
-        // don't collide across repos.
-        for sub in ["skills", "agents"] {
-            let src = claude_dir.join(sub);
-            if src.is_dir() {
-                let dest = ws_claude_dir.join(sub).join(&repo_name);
-                copy_dir_recursive(&src, &dest)?;
-            }
+        // Skills land flat in the workspace's skills/, each directory renamed
+        // (and its SKILL.md `name:` rewritten) with the repo as a prefix.
+        let src_skills = claude_dir.join("skills");
+        if src_skills.is_dir() {
+            copy_repo_skills(&src_skills, &ws_claude_dir.join("skills"), &repo_name)?;
+        }
+
+        // Agents stay namespaced under a per-project subdirectory.
+        let src_agents = claude_dir.join("agents");
+        if src_agents.is_dir() {
+            copy_dir_recursive(&src_agents, &ws_claude_dir.join("agents").join(&repo_name))?;
         }
 
         // Merge settings.local.json / mcp.json and collect any remaining files
@@ -412,6 +416,96 @@ fn merge_claude_dirs(workspace_dir: &Path, worktrees: &[(PathBuf, PathBuf)], qui
     Ok(())
 }
 
+/// Copy one repo's `.claude/skills/*` into the workspace's `.claude/skills/`,
+/// flattened: a repo's `my-skill` becomes `<repo>-my-skill`, both as the
+/// directory name and as the `name:` in its SKILL.md. Prefixing rather than
+/// nesting keeps every skill discoverable at the top level while still saying
+/// which project it came from, and keeps same-named skills from two repos apart.
+///
+/// Only directories are taken — a loose file sitting in `skills/` (a stray
+/// `.DS_Store`, say) isn't a skill.
+fn copy_repo_skills(src_skills: &Path, ws_skills: &Path, repo_name: &str) -> Result<()> {
+    let prefix = skill_prefix(repo_name);
+    for entry in std::fs::read_dir(src_skills)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let skill = entry.file_name().to_string_lossy().to_string();
+        let dest = ws_skills.join(format!("{prefix}-{skill}"));
+        copy_dir_recursive(&path, &dest)?;
+        prefix_skill_md(&dest, &prefix)?;
+    }
+    Ok(())
+}
+
+/// A repo name reduced to a skill-name-safe prefix: lowercase, with any run of
+/// non-alphanumerics collapsed to a single hyphen. Falls back to the raw name
+/// if that leaves nothing.
+fn skill_prefix(repo_name: &str) -> String {
+    let mut out = String::with_capacity(repo_name.len());
+    for c in repo_name.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+        } else if !out.is_empty() && !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    let trimmed = out.trim_matches('-');
+    if trimmed.is_empty() {
+        repo_name.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Rewrite a copied skill's SKILL.md so its `name:` carries `prefix`. A skill
+/// with no SKILL.md, an unreadable one, or one whose SKILL.md has no `name:`
+/// frontmatter is left exactly as copied — plenty of skills are plain prose.
+fn prefix_skill_md(skill_dir: &Path, prefix: &str) -> Result<()> {
+    let path = skill_dir.join("SKILL.md");
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return Ok(());
+    };
+    if let Some(updated) = prefix_skill_frontmatter_name(&content, prefix) {
+        std::fs::write(&path, updated)?;
+    }
+    Ok(())
+}
+
+/// Prefix the `name:` value in a SKILL.md's YAML frontmatter, returning the new
+/// file content — or `None` when there's nothing to rewrite: no frontmatter
+/// block opening the file, no top-level `name:` inside it, or an empty value.
+fn prefix_skill_frontmatter_name(content: &str, prefix: &str) -> Option<String> {
+    let mut lines: Vec<&str> = content.split('\n').collect();
+    // The frontmatter fence has to open the file.
+    if lines.first()?.trim_end() != "---" {
+        return None;
+    }
+    // `name:` counts only inside the block, so find the closing fence first.
+    let close = 1 + lines.iter().skip(1).position(|l| l.trim_end() == "---")?;
+    let idx = 1 + lines[1..close].iter().position(|l| l.starts_with("name:"))?;
+
+    let raw = lines[idx]["name:".len()..].trim();
+    // Keep whatever quoting style the file already used.
+    let (quote, bare) = match raw.chars().next() {
+        Some(q @ ('"' | '\'')) if raw.len() >= 2 && raw.ends_with(q) => {
+            (Some(q), &raw[1..raw.len() - 1])
+        }
+        _ => (None, raw),
+    };
+    if bare.is_empty() {
+        return None;
+    }
+    let renamed = match quote {
+        Some(q) => format!("name: {q}{prefix}-{bare}{q}"),
+        None => format!("name: {prefix}-{bare}"),
+    };
+    lines[idx] = &renamed;
+    Some(lines.join("\n"))
+}
+
 /// Recursively copy a directory tree from `src` into `dest`, creating `dest`
 /// and any parent directories. Existing files at `dest` are overwritten.
 fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
@@ -430,8 +524,8 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
 }
 
 /// Build the generated workspace `CLAUDE.md`: a short pointer telling Claude to
-/// read each project's own CLAUDE.md, plus a note on where namespaced skills and
-/// agents live.
+/// read each project's own CLAUDE.md, plus a note on where each project's skills
+/// and agents live.
 fn generate_workspace_claude_md(
     workspace_name: &str,
     projects: &[(String, Option<String>)],
@@ -452,9 +546,11 @@ fn generate_workspace_claude_md(
     }
     s.push_str(
         "\n## Skills and agents\n\n\
-         Skills and agents contributed by each project are namespaced by project:\n\n\
-         - `.claude/skills/<project>/…`\n\
-         - `.claude/agents/<project>/…`\n",
+         Skills contributed by each project sit at the top level of \
+         `.claude/skills/`, prefixed with the project they came from — a \
+         project's `my-skill` is `<project>-my-skill`, both as the directory \
+         and as the skill's own `name:`.\n\n\
+         Agents are namespaced by project: `.claude/agents/<project>/…`.\n",
     );
     s
 }
@@ -595,7 +691,7 @@ fn overlay_base_claude_dir_recursive(
 /// Recursively collect settings.local.json / mcp.json / other files from a
 /// .claude directory. CLAUDE.md and the top-level `skills/` and `agents/`
 /// directories are skipped — they're handled separately by
-/// [`merge_claude_dirs`] (generated pointer and per-project namespacing).
+/// [`merge_claude_dirs`] (generated pointer, prefixed skills, namespaced agents).
 fn collect_claude_entries(
     base: &Path,
     dir: &Path,
@@ -685,4 +781,105 @@ fn merge_settings_json(path: &Path, allow: &mut Vec<String>, deny: &mut Vec<Stri
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefixes_frontmatter_name() {
+        let md = "---\nname: verify\ndescription: Build and drive the app.\n---\n\n# Verifying\n";
+        let out = prefix_skill_frontmatter_name(md, "mobile").unwrap();
+        assert!(out.starts_with("---\nname: mobile-verify\ndescription:"));
+        // Everything after the frontmatter is untouched.
+        assert!(out.ends_with("---\n\n# Verifying\n"));
+    }
+
+    #[test]
+    fn keeps_the_files_own_quoting() {
+        let quoted = "---\nname: \"my-skill\"\n---\nbody\n";
+        assert!(prefix_skill_frontmatter_name(quoted, "repo1")
+            .unwrap()
+            .contains("name: \"repo1-my-skill\""));
+        let single = "---\nname: 'my-skill'\n---\nbody\n";
+        assert!(prefix_skill_frontmatter_name(single, "repo1")
+            .unwrap()
+            .contains("name: 'repo1-my-skill'"));
+    }
+
+    #[test]
+    fn leaves_skill_md_alone_when_theres_nothing_to_rewrite() {
+        // No frontmatter at all — plenty of SKILL.md files are plain prose.
+        assert!(prefix_skill_frontmatter_name("# Instructions\nDo the thing.\n", "backend").is_none());
+        // Frontmatter without a name key.
+        assert!(prefix_skill_frontmatter_name("---\ndescription: x\n---\nbody\n", "backend").is_none());
+        // Empty name value.
+        assert!(prefix_skill_frontmatter_name("---\nname:\n---\nbody\n", "backend").is_none());
+        // Unterminated frontmatter.
+        assert!(prefix_skill_frontmatter_name("---\nname: x\nbody\n", "backend").is_none());
+    }
+
+    #[test]
+    fn only_the_frontmatter_name_is_touched() {
+        // A `name:` in the body, after the block closes, must not be rewritten.
+        let md = "---\nname: real\n---\n\nname: not-frontmatter\n";
+        let out = prefix_skill_frontmatter_name(md, "portal").unwrap();
+        assert!(out.contains("name: portal-real"));
+        assert!(out.contains("\nname: not-frontmatter\n"));
+    }
+
+    #[test]
+    fn copies_skills_flat_with_prefixed_dirs_and_names() {
+        let tmp = std::env::temp_dir().join(format!("cutter-skills-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let src = tmp.join("repo/.claude/skills");
+        let ws = tmp.join("ws/.claude/skills");
+
+        // One skill with frontmatter, one plain-prose, plus nested files and a
+        // stray non-skill file at the top of skills/.
+        std::fs::create_dir_all(src.join("verify/references")).unwrap();
+        std::fs::write(
+            src.join("verify/SKILL.md"),
+            "---\nname: verify\ndescription: d\n---\n\nbody\n",
+        )
+        .unwrap();
+        std::fs::write(src.join("verify/references/notes.md"), "notes").unwrap();
+        std::fs::create_dir_all(src.join("create-mr")).unwrap();
+        std::fs::write(src.join("create-mr/SKILL.md"), "# Instructions\n").unwrap();
+        std::fs::write(src.join(".DS_Store"), "junk").unwrap();
+
+        copy_repo_skills(&src, &ws, "backend").unwrap();
+
+        // Flat, prefixed directories — no per-repo folder in between.
+        assert!(ws.join("backend-verify/SKILL.md").is_file());
+        assert!(ws.join("backend-create-mr/SKILL.md").is_file());
+        assert!(!ws.join("backend").exists());
+        // Nested content comes along.
+        assert_eq!(
+            std::fs::read_to_string(ws.join("backend-verify/references/notes.md")).unwrap(),
+            "notes"
+        );
+        // Frontmatter name rewritten; a prose SKILL.md left alone.
+        let renamed = std::fs::read_to_string(ws.join("backend-verify/SKILL.md")).unwrap();
+        assert!(renamed.starts_with("---\nname: backend-verify\n"));
+        assert_eq!(
+            std::fs::read_to_string(ws.join("backend-create-mr/SKILL.md")).unwrap(),
+            "# Instructions\n"
+        );
+        // A loose file in skills/ isn't a skill.
+        assert!(!ws.join("backend-.DS_Store").exists());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn repo_names_become_safe_prefixes() {
+        assert_eq!(skill_prefix("backend"), "backend");
+        assert_eq!(skill_prefix("branch-cut-admin"), "branch-cut-admin");
+        assert_eq!(skill_prefix("My_Repo"), "my-repo");
+        assert_eq!(skill_prefix("web.app v2"), "web-app-v2");
+        // Nothing usable left: keep the raw name rather than emit a bare hyphen.
+        assert_eq!(skill_prefix("!!!"), "!!!");
+    }
 }
