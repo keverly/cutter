@@ -47,6 +47,12 @@ const PR_DRAFT_COLOR: egui::Color32 = egui::Color32::from_rgb(0x8b, 0x94, 0x9e);
 const PR_OPEN_COLOR: egui::Color32 = egui::Color32::from_rgb(0x3f, 0xb9, 0x50);
 const PR_MERGED_COLOR: egui::Color32 = egui::Color32::from_rgb(0x8b, 0x5c, 0xf6);
 
+/// Purple branch icon marking a workspace with an open PR on any of its repos.
+/// It shares the list's single status slot with the Claude icons: a running
+/// session outranks it, and it outranks "waiting for input".
+const PR_BRANCH_ICON: &str = egui_phosphor::regular::GIT_BRANCH;
+const PR_BRANCH_COLOR: egui::Color32 = egui::Color32::from_rgb(0x8b, 0x5c, 0xf6);
+
 /// Launch the standalone Cutter GUI window.
 pub fn run() -> eframe::Result<()> {
     // Embedded terminals inherit this process's environment. Launched from
@@ -389,6 +395,10 @@ struct DetailActions {
     auto_link: bool,
     unlink_idx: Option<usize>,
 }
+
+/// One workspace's inputs for a PR-status fetch: its name, its branch, and its
+/// repos as `(repo name, worktree dir)` pairs.
+type PrFetchJob = (String, String, Vec<(String, String)>);
 
 struct CutterApp {
     tab: Tab,
@@ -1100,26 +1110,43 @@ impl CutterApp {
                     };
                     let status =
                         self.session_status.get(&name).copied().unwrap_or_default();
+                    // Owned hover text (not borrowed PRs) so the row can still
+                    // mutate `self` after rendering.
+                    let pr_hover = self.open_pr_hover(&name);
                     let clicked = ui
                         .horizontal(|ui| {
-                            // A leading icon shows Claude's status in a
-                            // fixed-width slot so names stay aligned; idle
-                            // workspaces leave the slot empty.
+                            // A leading icon shows the workspace's state in a
+                            // fixed-width slot so names stay aligned. One slot,
+                            // in precedence order: a running Claude session
+                            // outranks an open PR, which outranks "waiting for
+                            // input". Quiet workspaces leave the slot empty.
                             let slot = egui::vec2(18.0, 16.0);
-                            match status.state() {
-                                Some(state) => {
-                                    let (icon, color) = state_icon(state);
-                                    ui.add_sized(
-                                        slot,
-                                        egui::Label::new(
-                                            egui::RichText::new(icon).color(color),
-                                        ),
-                                    )
-                                    .on_hover_text(status_hover(state, status));
-                                }
-                                None => {
-                                    ui.add_sized(slot, egui::Label::new(""));
-                                }
+                            let state = status.state();
+                            if state == Some(SessionState::Running) {
+                                let (icon, color) = state_icon(SessionState::Running);
+                                ui.add_sized(
+                                    slot,
+                                    egui::Label::new(egui::RichText::new(icon).color(color)),
+                                )
+                                .on_hover_text(status_hover(SessionState::Running, status));
+                            } else if let Some(hover) = &pr_hover {
+                                ui.add_sized(
+                                    slot,
+                                    egui::Label::new(
+                                        egui::RichText::new(PR_BRANCH_ICON)
+                                            .color(PR_BRANCH_COLOR),
+                                    ),
+                                )
+                                .on_hover_text(hover);
+                            } else if let Some(state) = state {
+                                let (icon, color) = state_icon(state);
+                                ui.add_sized(
+                                    slot,
+                                    egui::Label::new(egui::RichText::new(icon).color(color)),
+                                )
+                                .on_hover_text(status_hover(state, status));
+                            } else {
+                                ui.add_sized(slot, egui::Label::new(""));
                             }
                             ui.selectable_label(is_selected, label).clicked()
                         })
@@ -1217,8 +1244,6 @@ impl CutterApp {
         let mut list = ListActions::default();
         // Detail-pane intents for the selected workspace.
         let mut actions = DetailActions::default();
-        // A workspace whose PR status needs fetching (lazy, once per workspace).
-        let mut pr_fetch_request: Option<String> = None;
 
         // Collapsed, the list is the whole window; expanded, it's the left
         // panel with the selected workspace's pane beside it.
@@ -1265,8 +1290,8 @@ impl CutterApp {
                     });
 
                     // PR chips under the workspace name (one per in-flight PR across
-                    // the repos), coloured by status and linking to GitHub. Fetched
-                    // lazily the first time the workspace is shown.
+                    // the repos), coloured by status and linking to GitHub. Filled
+                    // in by the background sweep (see `start_pr_sweep`).
                     match self.pr_status.get(&name) {
                         Some(prs) if !prs.is_empty() => {
                             ui.horizontal(|ui| {
@@ -1287,11 +1312,7 @@ impl CutterApp {
                             });
                         }
                         Some(_) => {} // fetched, none in flight → show nothing
-                        None => {
-                            if !self.pr_fetching.contains(&name) {
-                                pr_fetch_request = Some(name.clone());
-                            }
-                        }
+                        None => {}    // still being fetched → show nothing yet
                     }
 
                     ui.separator();
@@ -1363,9 +1384,6 @@ impl CutterApp {
             if let Some(Selection::Workspace(name)) = self.selected.clone() {
                 self.start_ai_link(&ctx, name);
             }
-        }
-        if let Some(name) = pr_fetch_request {
-            self.start_pr_fetch(&ctx, name);
         }
         if let Some(idx) = actions.unlink_idx {
             if let Some(Selection::Workspace(name)) = self.selected.clone() {
@@ -1858,31 +1876,79 @@ impl CutterApp {
             .or_else(|| Some(self.default_branch_from.clone()))
     }
 
-    fn start_pr_fetch(&mut self, ctx: &egui::Context, ws_name: String) {
-        if self.pr_fetching.contains(&ws_name) || self.pr_status.contains_key(&ws_name) {
-            return;
-        }
-        let Some(ws) = self.workspaces.iter().find(|w| w.workspace.name == ws_name) else {
-            return;
-        };
-        let repos: Vec<(String, String)> = ws
-            .repos
+    /// Hover text listing a workspace's open PRs, or `None` when it has none
+    /// (or its status hasn't been fetched yet).
+    fn open_pr_hover(&self, ws_name: &str) -> Option<String> {
+        let open: Vec<&pr::PrInfo> = self
+            .pr_status
+            .get(ws_name)?
             .iter()
-            .map(|r| (r.name.clone(), r.worktree_path.clone()))
+            .filter(|p| p.state.is_open())
             .collect();
-        if repos.is_empty() {
-            // Nothing to query; record an empty result so we don't retry.
-            self.pr_status.insert(ws_name, Vec::new());
+        if open.is_empty() {
+            return None;
+        }
+        let mut text = match open.len() {
+            1 => "1 open pull request".to_string(),
+            n => format!("{n} open pull requests"),
+        };
+        for p in open {
+            text.push_str(&format!("\n{} #{} ({})", p.repo, p.number, p.state.label()));
+        }
+        Some(text)
+    }
+
+    /// Fetch PR status for every workspace that hasn't got it cached yet, so the
+    /// list can flag the ones with an open PR — not just the selected one.
+    ///
+    /// A workspace costs one (slow) `gh` call per repo, so the whole sweep runs
+    /// on a single background thread rather than one thread per workspace, which
+    /// would fan out to dozens of concurrent subprocesses. Each workspace's
+    /// result is sent as it lands, and the selected workspace goes first since
+    /// its PR chips are on screen.
+    fn start_pr_sweep(&mut self, ctx: &egui::Context) {
+        let mut pending: Vec<PrFetchJob> = Vec::new();
+        for ws in &self.workspaces {
+            let name = &ws.workspace.name;
+            if self.pr_status.contains_key(name) || self.pr_fetching.contains(name) {
+                continue;
+            }
+            let repos: Vec<(String, String)> = ws
+                .repos
+                .iter()
+                .map(|r| (r.name.clone(), r.worktree_path.clone()))
+                .collect();
+            pending.push((name.clone(), ws.workspace.branch.clone(), repos));
+        }
+        // Repo-less workspaces have nothing to query: record an empty result
+        // straight away so they don't come back around on the next frame.
+        pending.retain(|(name, _, repos)| {
+            if repos.is_empty() {
+                self.pr_status.insert(name.clone(), Vec::new());
+                false
+            } else {
+                true
+            }
+        });
+        if pending.is_empty() {
             return;
         }
-        let branch = ws.workspace.branch.clone();
-        self.pr_fetching.insert(ws_name.clone());
+        if let Some(Selection::Workspace(sel)) = &self.selected {
+            if let Some(i) = pending.iter().position(|(name, _, _)| name == sel) {
+                pending.swap(0, i);
+            }
+        }
+        for (name, _, _) in &pending {
+            self.pr_fetching.insert(name.clone());
+        }
         let tx = self.pr_tx.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let prs = pr::fetch(&repos, &branch);
-            let _ = tx.send((ws_name, prs));
-            ctx.request_repaint();
+            for (name, branch, repos) in pending {
+                let prs = pr::fetch(&repos, &branch);
+                let _ = tx.send((name, prs));
+                ctx.request_repaint();
+            }
         });
     }
 
@@ -2790,6 +2856,11 @@ impl eframe::App for CutterApp {
         if do_refresh {
             self.reload();
         }
+
+        // Top up PR status for any workspace still missing it (new workspaces,
+        // or everything after a Refresh cleared the cache). A no-op once every
+        // workspace is cached or in flight.
+        self.start_pr_sweep(&ctx);
 
         match self.tab {
             Tab::Workspaces => self.workspaces_ui(ui),
