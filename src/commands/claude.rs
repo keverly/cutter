@@ -5,10 +5,13 @@
 
 use std::collections::HashSet;
 use std::ffi::OsString;
+use std::fs::File;
 use std::io::{Read, Write};
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use crate::cli::ClaudeMode;
 use crate::error::{Error, Result};
 
 /// Locate the `claude` binary, honoring the `CUTTER_CLAUDE_BIN` override.
@@ -19,6 +22,97 @@ pub fn resolve_claude() -> PathBuf {
         }
     }
     find_binary("claude").unwrap_or_else(|| PathBuf::from("claude"))
+}
+
+pub fn launch(dir: &Path, mode: ClaudeMode) -> Result<()> {
+    let args: &[&str] = match mode {
+        ClaudeMode::None => return Ok(()),
+        ClaudeMode::Normal => &[],
+        ClaudeMode::DangerouslySkipPermissions => &["--dangerously-skip-permissions"],
+        ClaudeMode::Desktop => return open_desktop(dir),
+    };
+    let status = Command::new(resolve_claude())
+        .args(args)
+        .current_dir(dir)
+        .status()
+        .map_err(launch_error)?;
+    if !status.success() {
+        return Err(Error::Git("claude exited with non-zero status".into()));
+    }
+    Ok(())
+}
+
+fn open_desktop(dir: &Path) -> Result<()> {
+    let (master, slave) = open_pty()?;
+    let mut child = Command::new(resolve_claude())
+        .arg("--desktop")
+        .current_dir(dir)
+        .stdin(Stdio::from(slave.try_clone()?))
+        .stdout(Stdio::from(slave.try_clone()?))
+        .stderr(Stdio::from(slave))
+        .spawn()
+        .map_err(launch_error)?;
+
+    let mut output = Vec::new();
+    let _ = File::from(master).read_to_end(&mut output);
+    let status = child.wait()?;
+    if status.success() {
+        return Ok(());
+    }
+    let output = strip_ansi(&String::from_utf8_lossy(&output));
+    let detail = output.trim();
+    Err(Error::Git(if detail.is_empty() {
+        "claude --desktop exited with non-zero status".into()
+    } else {
+        format!("claude --desktop failed: {detail}")
+    }))
+}
+
+fn open_pty() -> Result<(OwnedFd, OwnedFd)> {
+    let mut master: libc::c_int = -1;
+    let mut slave: libc::c_int = -1;
+    let rc = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    unsafe {
+        libc::fcntl(master, libc::F_SETFD, libc::FD_CLOEXEC);
+        libc::fcntl(slave, libc::F_SETFD, libc::FD_CLOEXEC);
+        Ok((OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)))
+    }
+}
+
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            if chars.next() == Some('[') {
+                for c in chars.by_ref() {
+                    if ('@'..='~').contains(&c) {
+                        break;
+                    }
+                }
+            }
+        } else if c != '\r' {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn launch_error(e: std::io::Error) -> Error {
+    Error::Git(format!(
+        "could not launch `claude` ({e}). Is Claude Code installed and on your PATH?"
+    ))
 }
 
 /// Directories worth searching for CLI tools beyond `$PATH` — covers the case

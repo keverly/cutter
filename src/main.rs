@@ -18,20 +18,26 @@ fn main() {
             print,
             open_claude,
             open_claude_dangerous,
+            desktop,
             ai,
-        } => match ai {
-            Some(prompt) => commands::ai::run(&prompt, base.as_deref()).map(|_| ()),
-            None => {
-                let claude_mode = if open_claude_dangerous {
-                    ClaudeMode::DangerouslySkipPermissions
-                } else if open_claude {
-                    ClaudeMode::Normal
-                } else {
-                    ClaudeMode::None
-                };
-                commands::create::run(name.as_deref(), base.as_deref(), print, claude_mode)
+        } => {
+            let claude_mode = if desktop {
+                ClaudeMode::Desktop
+            } else if open_claude_dangerous {
+                ClaudeMode::DangerouslySkipPermissions
+            } else if open_claude {
+                ClaudeMode::Normal
+            } else {
+                ClaudeMode::None
+            };
+            match ai {
+                Some(prompt) => commands::ai::run(&prompt, base.as_deref()).and_then(|name| match claude_mode {
+                    ClaudeMode::None => Ok(()),
+                    mode => commands::open::run(&name, mode),
+                }),
+                None => commands::create::run(name.as_deref(), base.as_deref(), print, claude_mode),
             }
-        },
+        }
         Command::List => commands::list::run(),
         Command::Status { name } => {
             let name = match name {
@@ -45,8 +51,10 @@ fn main() {
         }
         Command::Remove { name, keep_files } => commands::remove::run(&name, keep_files),
         Command::Locate { name } => commands::open::run(&name, ClaudeMode::None),
-        Command::OpenClaude { name, dangerous } => {
-            let mode = if dangerous {
+        Command::OpenClaude { name, dangerous, desktop } => {
+            let mode = if desktop {
+                ClaudeMode::Desktop
+            } else if dangerous {
                 ClaudeMode::DangerouslySkipPermissions
             } else {
                 ClaudeMode::Normal

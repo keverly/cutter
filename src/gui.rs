@@ -337,8 +337,8 @@ enum RemoveTarget {
 /// manual name/base form.
 #[derive(Clone, Copy, PartialEq)]
 enum NewWsMode {
-    Ai,
     Manual,
+    Ai,
 }
 
 /// Intents collected while the workspace list renders, applied once the panel
@@ -357,6 +357,7 @@ struct ListActions {
     commit_rename: Option<u64>,
     /// Abandon the in-progress rename.
     cancel_rename: bool,
+    remove: Option<String>,
 }
 
 /// A user intent collected during a UI pass, applied after rendering so the
@@ -364,8 +365,8 @@ struct ListActions {
 enum PendingAction {
     CreateBase { name: String, paths: Vec<String> },
     RemoveBase(String),
-    CreateWorkspace { name: String, base: String },
-    CreateWorkspaceAi { prompt: String, base: Option<String> },
+    CreateWorkspace { name: String, base: String, desktop: bool },
+    CreateWorkspaceAi { prompt: String, base: Option<String>, desktop: bool },
     RemoveWorkspace(String),
 }
 
@@ -463,7 +464,7 @@ struct CutterApp {
     // choose).
     new_ws_ai: String,
     new_ws_mode: NewWsMode,
-    new_ws_ai_base: Option<String>,
+    new_ws_open_desktop: bool,
 
     // Pending "are you sure?" for a destructive action.
     confirm_remove: Option<RemoveTarget>,
@@ -550,8 +551,8 @@ impl CutterApp {
             new_ws_name: String::new(),
             new_ws_base: None,
             new_ws_ai: String::new(),
-            new_ws_mode: NewWsMode::Ai,
-            new_ws_ai_base: None,
+            new_ws_mode: NewWsMode::Manual,
+            new_ws_open_desktop: false,
             confirm_remove: None,
             show_link_windows: false,
             link_for: None,
@@ -996,7 +997,7 @@ impl CutterApp {
                     Ok(format!("Base '{display}' removed"))
                 });
             }
-            PendingAction::CreateWorkspace { name, base } => {
+            PendingAction::CreateWorkspace { name, base, desktop } => {
                 let label = format!("Creating workspace '{name}'…");
                 // Optimistically select it; reload keeps the selection if it landed.
                 self.selected = Some(Selection::Workspace(name.clone()));
@@ -1004,14 +1005,22 @@ impl CutterApp {
                 self.start_job(ctx, label, move || {
                     commands::create::run(Some(&name), Some(&base), false, ClaudeMode::None)
                         .map_err(|e| e.to_string())?;
+                    if desktop {
+                        commands::open::run(&name, ClaudeMode::Desktop)
+                            .map_err(|e| format!("Workspace '{display}' created, but {e}"))?;
+                    }
                     Ok(format!("Workspace '{display}' created"))
                 });
             }
-            PendingAction::CreateWorkspaceAi { prompt, base } => {
+            PendingAction::CreateWorkspaceAi { prompt, base, desktop } => {
                 let label = "Creating workspace with AI…".to_string();
                 self.start_job(ctx, label, move || {
                     let name = commands::ai::run(&prompt, base.as_deref())
                         .map_err(|e| e.to_string())?;
+                    if desktop {
+                        commands::open::run(&name, ClaudeMode::Desktop)
+                            .map_err(|e| format!("Workspace '{name}' created, but {e}"))?;
+                    }
                     Ok(format!("Workspace '{name}' created"))
                 });
             }
@@ -1148,7 +1157,17 @@ impl CutterApp {
                             } else {
                                 ui.add_sized(slot, egui::Label::new(""));
                             }
-                            ui.selectable_label(is_selected, label).clicked()
+                            let resp = ui.selectable_label(is_selected, label);
+                            resp.context_menu(|ui| {
+                                if ui
+                                    .add_enabled(!job_active, egui::Button::new("🗑 Remove"))
+                                    .clicked()
+                                {
+                                    out.remove = Some(name.clone());
+                                    ui.close();
+                                }
+                            });
+                            resp.clicked()
                         })
                         .inner;
                     if clicked {
@@ -1372,7 +1391,7 @@ impl CutterApp {
                 focus: true,
             });
         }
-        if let Some(name) = actions.remove {
+        if let Some(name) = actions.remove.or(list.remove) {
             self.confirm_remove = Some(RemoveTarget::Workspace(name));
         }
         if actions.open_link {
@@ -1691,12 +1710,8 @@ impl CutterApp {
 
     fn open_new_workspace(&mut self) {
         self.show_new_workspace = true;
-        let first_base = self.bases.keys().next().cloned();
         if self.new_ws_base.is_none() {
-            self.new_ws_base = first_base.clone();
-        }
-        if self.new_ws_ai_base.is_none() {
-            self.new_ws_ai_base = first_base;
+            self.new_ws_base = self.bases.keys().next().cloned();
         }
     }
 
@@ -2529,8 +2544,8 @@ impl CutterApp {
             .show(ctx, |ui| {
                 // Mode switcher at the top: AI vs. manual.
                 ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.new_ws_mode, NewWsMode::Ai, "🤖 AI");
                     ui.selectable_value(&mut self.new_ws_mode, NewWsMode::Manual, "Manual");
+                    ui.selectable_value(&mut self.new_ws_mode, NewWsMode::Ai, "🤖 AI");
                 });
                 ui.separator();
                 ui.add_space(6.0);
@@ -2561,7 +2576,7 @@ impl CutterApp {
                             );
                         } else {
                             let current = self
-                                .new_ws_ai_base
+                                .new_ws_base
                                 .clone()
                                 .unwrap_or_else(|| "Select a base".to_string());
                             let names: Vec<String> = self.bases.keys().cloned().collect();
@@ -2571,19 +2586,22 @@ impl CutterApp {
                                 .show_ui(ui, |ui| {
                                     for n in names {
                                         let selected =
-                                            self.new_ws_ai_base.as_deref() == Some(n.as_str());
+                                            self.new_ws_base.as_deref() == Some(n.as_str());
                                         if ui.selectable_label(selected, &n).clicked() {
-                                            self.new_ws_ai_base = Some(n);
+                                            self.new_ws_base = Some(n);
                                         }
                                     }
                                 });
                         }
 
                         ui.add_space(8.0);
+                        ui.checkbox(&mut self.new_ws_open_desktop, "Open in Claude Desktop");
+
+                        ui.add_space(8.0);
                         ui.separator();
                         ui.horizontal(|ui| {
                             let ai_ok = !self.new_ws_ai.trim().is_empty()
-                                && self.new_ws_ai_base.is_some()
+                                && self.new_ws_base.is_some()
                                 && self.job.is_none();
                             if ui
                                 .add_enabled(ai_ok, egui::Button::new("🤖 Create with AI"))
@@ -2591,7 +2609,8 @@ impl CutterApp {
                             {
                                 *action = Some(PendingAction::CreateWorkspaceAi {
                                     prompt: self.new_ws_ai.trim().to_string(),
-                                    base: self.new_ws_ai_base.clone(),
+                                    base: self.new_ws_base.clone(),
+                                    desktop: self.new_ws_open_desktop,
                                 });
                                 close = true;
                             }
@@ -2638,6 +2657,9 @@ impl CutterApp {
                         }
 
                         ui.add_space(8.0);
+                        ui.checkbox(&mut self.new_ws_open_desktop, "Open in Claude Desktop");
+
+                        ui.add_space(8.0);
                         ui.separator();
                         ui.horizontal(|ui| {
                             let can_create =
@@ -2649,6 +2671,7 @@ impl CutterApp {
                                 *action = Some(PendingAction::CreateWorkspace {
                                     name: name.clone(),
                                     base: self.new_ws_base.clone().unwrap(),
+                                    desktop: self.new_ws_open_desktop,
                                 });
                                 close = true;
                             }
@@ -2665,7 +2688,6 @@ impl CutterApp {
             self.new_ws_name.clear();
             self.new_ws_base = None;
             self.new_ws_ai.clear();
-            self.new_ws_ai_base = None;
         }
     }
 

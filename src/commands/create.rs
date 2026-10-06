@@ -72,7 +72,7 @@ pub fn run(name: Option<&str>, base_name: Option<&str>, print: bool, claude_mode
     };
 
     let claude_mode = if interactive && claude_mode == ClaudeMode::None && !print {
-        let items = &["No", "Claude", "Claude (--dangerously-skip-permissions)"];
+        let items = &["No", "Claude", "Claude (--dangerously-skip-permissions)", "Claude Desktop"];
         let selection = Select::new()
             .with_prompt("Open with Claude after creation?")
             .items(items)
@@ -82,6 +82,7 @@ pub fn run(name: Option<&str>, base_name: Option<&str>, print: bool, claude_mode
         match selection {
             1 => ClaudeMode::Normal,
             2 => ClaudeMode::DangerouslySkipPermissions,
+            3 => ClaudeMode::Desktop,
             _ => ClaudeMode::None,
         }
     } else {
@@ -223,28 +224,7 @@ pub fn run(name: Option<&str>, base_name: Option<&str>, print: bool, claude_mode
     if print {
         println!("{}", workspace_dir.display());
     }
-    match claude_mode {
-        ClaudeMode::Normal => {
-            let status = std::process::Command::new("claude")
-                .current_dir(&workspace_dir)
-                .status()?;
-            if !status.success() {
-                return Err(Error::Git("claude exited with non-zero status".into()));
-            }
-        }
-        ClaudeMode::DangerouslySkipPermissions => {
-            let status = std::process::Command::new("claude")
-                .arg("--dangerously-skip-permissions")
-                .current_dir(&workspace_dir)
-                .status()?;
-            if !status.success() {
-                return Err(Error::Git("claude exited with non-zero status".into()));
-            }
-        }
-        ClaudeMode::None => {}
-    }
-
-    Ok(())
+    crate::commands::claude::launch(&workspace_dir, claude_mode)
 }
 
 /// Copy configured files from each source repo into its corresponding worktree.

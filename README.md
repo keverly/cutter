@@ -54,7 +54,8 @@ The window has two tabs:
   or switch to **Details** for its base, branch, path, per-repo worktrees, and
   any live sessions. Use **➕ New** to create a workspace — either by describing
   it and letting Claude set it up (see [AI-driven creation](#ai-driven-creation))
-  or by filling in a name and base — and **🗑 Remove** (in Details) to tear one down.
+  or by filling in a name and base — and **🗑 Remove** (in Details, or by
+  right-clicking a workspace in the list) to tear one down.
 - **Settings** — the workspace root, default branch-from, and each base with
   its repos, `branch_from`, and `copy_files`. Use **➕ New base** to define one
   (browse for repo folders or type paths), **Edit** to add/remove its repos and
@@ -238,16 +239,23 @@ cutter remove my-feature
 | `cutter status <name>` | Show repo status (branch, changes, ahead/behind) |
 | `cutter remove <name>` | Remove worktrees, branch, and workspace directory |
 | `cutter locate <name>` | Print workspace path (for `cd $(cutter locate <name>)`) |
-| `cutter open-claude <name>` | Launch `claude` in a workspace directory |
+| `cutter open-claude <name> [--dangerous \| --desktop]` | Launch `claude` in a workspace directory, or open it in the Claude desktop app |
 
 ### Create flags
 
 - `--print` — print workspace path to stdout (for `cd $(cutter create ... --print)`)
 - `--open-claude` — launch `claude` in the workspace directory after creation
+- `--open-claude-dangerous` — same, with `--dangerously-skip-permissions`
+- `--desktop` — open the workspace in the Claude desktop app after creation
+  (runs `claude --desktop` in the workspace directory). Works with `--ai` too.
 - `--ai "<prompt>"` — describe the workspace in natural language and let a
   headless Claude session name it, pick a base, and create it (see
   [AI-driven creation](#ai-driven-creation)). Conflicts with a positional name
-  and with `--print`/`--open-claude`.
+  and with `--print`/`--open-claude`/`--open-claude-dangerous`.
+
+When `cutter create` prompts interactively, it asks where to open the new
+workspace: not at all, Claude, Claude with `--dangerously-skip-permissions`, or
+Claude Desktop.
 
 ### Remove flags
 
@@ -284,9 +292,12 @@ names it. Without it, Claude chooses from your configured bases.
   configured. Set `CUTTER_CLAUDE_BIN` to point at a specific `claude` binary if
   it isn't discoverable.
 
-In the GUI, the **➕ New** dialog has a **🤖 AI** / **Manual** switcher at the
-top: **AI** shows a prompt box, a base picker, and a **🤖 Create with AI**
-button, while **Manual** shows the name and base fields.
+In the GUI, the **➕ New** dialog has a **Manual** / **🤖 AI** switcher at the
+top, opening on **Manual**: **Manual** shows the name and base fields, while
+**AI** shows a prompt box, a base picker, and a **🤖 Create with AI** button.
+The selected base carries over when you switch between them. Either way, tick
+**Open in Claude Desktop** to hand the new workspace to the Claude desktop app
+once it's created; the choice sticks for the rest of the app session.
 
 ## Branch From
 

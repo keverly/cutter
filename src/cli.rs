@@ -6,6 +6,7 @@ pub enum ClaudeMode {
     None,
     Normal,
     DangerouslySkipPermissions,
+    Desktop,
 }
 
 /// A Claude Code session lifecycle event, as reported by a hook. Value names are
@@ -64,6 +65,9 @@ pub enum Command {
         /// Launch claude with --dangerously-skip-permissions in workspace dir after creation
         #[arg(long, group = "open_mode")]
         open_claude_dangerous: bool,
+
+        #[arg(long, group = "open_mode", help = "Open the workspace in the Claude desktop app after creation")]
+        desktop: bool,
     },
 
     /// List all workspaces
@@ -99,6 +103,9 @@ pub enum Command {
         /// Use --dangerously-skip-permissions
         #[arg(long)]
         dangerous: bool,
+
+        #[arg(long, conflicts_with = "dangerous", help = "Open in the Claude desktop app instead of the terminal")]
+        desktop: bool,
     },
 
     /// Internal: record a Claude Code session lifecycle event. Invoked by the
