@@ -12,7 +12,10 @@ pub mod ai_link;
 #[cfg(feature = "gui")]
 pub mod gui;
 
-#[cfg(feature = "gui")]
+#[cfg(feature = "menubar")]
+pub mod menubar;
+
+#[cfg(any(feature = "gui", feature = "menubar"))]
 pub mod pr;
 
 #[cfg(feature = "gui")]

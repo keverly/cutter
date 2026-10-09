@@ -43,6 +43,14 @@ core-foundation-sys = { version = "0.8", optional = true }
 core-graphics = { version = "0.24", optional = true }
 egui-phosphor = { version = "0.12", optional = true }
 
+# The menu bar app (`cutter-menubar`, macOS only): an NSStatusItem with a
+# native menu of workspaces and AppKit dialogs, driven straight through AppKit.
+# These are the objc2 versions winit already depends on, so they add no crates
+# to the lockfile.
+objc2 = { version = "0.6", optional = true }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSObject", "NSString", "NSAttributedString", "NSDictionary", "NSGeometry", "NSTimer", "NSDate"], optional = true }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSRunningApplication", "NSResponder", "NSStatusBar", "NSStatusItem", "NSStatusBarButton", "NSButton", "NSControl", "NSView", "NSMenu", "NSMenuItem", "NSImage", "NSCell", "NSButtonCell", "NSColor", "NSAttributedString", "NSFont", "objc2-core-foundation", "NSAlert", "NSTextField", "NSPopUpButton", "NSWindow"], optional = true }
+
 [features]
 # Builds the standalone Cutter.app GUI (the `cutter-gui` binary).
 gui = [
@@ -58,8 +66,21 @@ gui = [
     "dep:core-graphics",
 ]
 
+# Builds the menu bar app (the `cutter-menubar` binary): a native AppKit app
+# with no window, kept separate from the GUI so it stays small.
+menubar = [
+    "dep:objc2",
+    "dep:objc2-foundation",
+    "dep:objc2-app-kit",
+]
+
 # The default CLI binary stays lean; the GUI is opt-in behind `--features gui`.
 [[bin]]
 name = "cutter-gui"
 path = "src/bin/cutter-gui.rs"
 required-features = ["gui"]
+
+[[bin]]
+name = "cutter-menubar"
+path = "src/bin/cutter-menubar.rs"
+required-features = ["menubar"]

@@ -202,6 +202,42 @@ per repo, fetched in the background and cached, so it needs `gh` installed and
 authenticated. Repos without a GitHub remote simply contribute no chips. Hit
 **⟳ Refresh** to re-query.
 
+## Menu bar app (Cutter Menu.app)
+
+A separate, lightweight app that puts Cutter in the macOS menu bar (a branch
+icon). It has no window and no Dock icon, and it works on its own: it never
+opens Cutter.app.
+
+```sh
+# Build dist/Cutter Menu.app
+./scripts/build-menubar-app.sh
+
+# Run it, or install it to /Applications
+open "dist/Cutter Menu.app"
+cp -r "dist/Cutter Menu.app" /Applications/
+```
+
+Its menu lists every workspace with its Claude status dot (orange running, green
+waiting for input) and its pull requests, coloured by state (grey draft, green
+open, purple merged). Hover a workspace for:
+
+- **Open in Claude Desktop**, **Open in Terminal**, **Show in Finder**
+- its pull requests, each opening on GitHub
+- **Remove…**, after a confirmation
+
+**New Workspace…** asks for a name, a base and whether to open it in Claude
+Desktop, then creates it; **New Workspace with AI…** takes a description
+instead (see [AI-driven creation](#ai-driven-creation)). While a create or remove
+runs, the icon turns into arrows and the menu shows what it's doing; a failure
+pops up an alert.
+
+The menu is read fresh from disk each time it opens, so workspaces made with
+the CLI or Cutter.app show up too. Pull-request status is checked in the
+background (with `gh`, like the GUI) and re-checked every five minutes, so a PR
+merged while the app sat in the menu bar shows as merged; **Check Pull Requests
+Now** forces it. To start it at login, add it under **System Settings ▸ General
+▸ Login Items**.
+
 ## Quick Start
 
 ```sh
